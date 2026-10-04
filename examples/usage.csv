@@ -1,5 +1,5 @@
-employee,email,application,last_login,usage_count
-Alice,alice@company.com,Slack,2026-09-28,42
-Bob,bob@company.com,Slack,2025-11-02,1
-John,john@company.com,Google Workspace,2026-08-01,12
-Cara,cara@company.com,Notion,2026-10-01,2
+employee,employee_id,email,application,last_login,usage_count,active_days,usage_window_days,features_used
+Alice,E001,alice@company.com,Slack,2026-09-28,42,25,30,5
+Bob,E002,robert@company.com,Slack,2025-11-02,1,1,30,1
+John,E003,john@company.com,Google Workspace,2026-08-01,12,12,30,4
+Cara,E004,cara@company.com,Notion,2026-10-01,2,2,30,1

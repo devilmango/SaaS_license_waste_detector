@@ -1,67 +1,52 @@
 # SaaS Sentry
 
-**A lightweight, local CLI for finding unused SaaS licenses and estimating subscription waste.**
+**A local CLI for finding unused SaaS licenses and estimating contract-aware subscription savings.**
 
-SaaS Sentry combines an HR roster, SaaS activity export, and license billing export to identify licenses that may be reclaimed or optimized. It turns those records into an explainable, application-level savings report using configurable business rules. No AI service, SaaS account access, or third-party runtime package is required.
-
-> **Review before acting:** Findings are recommendations for a person to investigate. SaaS Sentry does not disable accounts, change subscriptions, or cancel contracts.
+SaaS Sentry joins HR, SaaS usage, and billing exports to flag terminated accounts, stale activity, and costly low-use licenses. It produces an explainable savings report, a data-quality file, and a persistent review ledger. It runs locally, makes no network requests, and never changes accounts or subscriptions.
 
 ## Contents
 
-- [Why SaaS Sentry](#why-saas-sentry)
 - [Features](#features)
 - [How it works](#how-it-works)
-- [Requirements](#requirements)
 - [Install](#install)
 - [Quick start](#quick-start)
-- [Input CSV formats](#input-csv-formats)
+- [CSV formats](#csv-formats)
 - [Rules and configuration](#rules-and-configuration)
-- [Understanding the report](#understanding-the-report)
-- [Data handling and validation](#data-handling-and-validation)
-- [Project structure](#project-structure)
+- [Review workflow](#review-workflow)
+- [Savings estimates](#savings-estimates)
+- [Data quality and privacy](#data-quality-and-privacy)
+- [CI and development](#ci-and-development)
 - [Roadmap](#roadmap)
-- [Contributing](#contributing)
 - [License](#license)
-
-## Why SaaS Sentry
-
-As SaaS portfolios grow, it becomes harder to reconcile who works at the company, who uses each product, which accounts still hold licenses, and what those licenses cost. SaaS Sentry demonstrates that a useful first pass can come from ordinary CSV exports and transparent rules:
-
-- **ETL:** read, validate, and normalize HR, usage, and billing records.
-- **Identity resolution:** match records by normalized email.
-- **Business rules:** flag terminated accounts, stale activity, and expensive low-usage licenses.
-- **Cost modeling:** estimate annual savings from per-license annual costs.
-- **Reporting:** produce a readable CLI summary and machine-readable findings CSV.
 
 ## Features
 
-- Analyze three local CSV exports with one command.
-- Match email addresses without regard to case or surrounding whitespace.
-- Use HR status as the authoritative employee status.
-- Prioritize terminated-account reclaim, then inactivity, then costly low usage.
-- Avoid counting one license in multiple finding categories.
-- Configure stale-login, annual-cost, and usage-count thresholds.
-- Set an analysis date to make stale-login results reproducible.
-- Export individual findings, explanations, and annual savings to CSV.
-- Run offline with Python's standard library.
+- Load HR, SaaS usage, and billing CSVs with standard-library Python.
+- Resolve identities by stable employee ID, primary email, or semicolon-separated email aliases.
+- Report conflicting and unmatched identities in a separate CSV for remediation.
+- Detect terminated accounts, stale or missing logins, and expensive licenses with low usage.
+- Use active days and usage windows as comparable activity signals; retain usage counts and feature counts as evidence.
+- Convert per-user annual costs from multiple currencies using configured, dated rates.
+- Respect contract seat minimums and renewal dates when estimating recoverable savings.
+- Record confirmed, dismissed, and deferred findings with owner, review date, and rationale.
+- Export findings with stable IDs, decision evidence, savings scenarios, and review state.
 
 ## How it works
 
 ```text
-HR CSV ─────────────┐
-Usage CSV ──────────┼─> Validate and normalize ─> Match identities ─> Apply rules ─> Savings report
-Billing CSV ────────┘
+HR CSV ──────────────┐
+Usage CSV ───────────┼─> Validate and resolve identity ─> Apply rules ─> Savings scenarios
+Billing + contracts ┘                                      │
+                                                          ├─> Findings CSV
+                                                          ├─> Data-quality CSV
+                                                          └─> Review ledger
 ```
 
-The exact join key is email, stripped of surrounding whitespace and case-folded. Each billing row represents one user's license for one application. Annual costs should be supplied in INR, and usage counts should use a consistent period across the usage export.
-
-## Requirements
-
-- Python 3.11 or newer
-- `pip` and `venv` for the editable installation instructions below
-- No third-party runtime dependencies
+Each billing row represents one assigned user/application license. Billing costs are annual per-seat amounts in the row currency (or configured default currency). The engine joins by employee ID and email where supplied, and reports contradictory identifiers rather than guessing.
 
 ## Install
+
+Requirements: Python 3.11 or newer. There are no third-party runtime dependencies.
 
 ```bash
 git clone https://github.com/<OWNER>/saas-sentry.git
@@ -72,183 +57,167 @@ python -m pip install --upgrade pip
 python -m pip install -e .
 ```
 
-On Windows PowerShell, activate the environment with:
-
-```powershell
-.venv\Scripts\Activate.ps1
-```
-
-The editable install provides the `saas-sentry` command. To run directly from a checkout without installing the package:
-
-```bash
-PYTHONPATH=src python3 -m saas_sentry.cli --help
-```
+For PowerShell activation, use `.venv\Scripts\Activate.ps1`. From an uninstalled checkout, use `PYTHONPATH=src python3 -m saas_sentry.cli --help`.
 
 ## Quick start
 
-Use the included example exports:
+Analyze the included synthetic exports with the example rules and dated currency table:
 
 ```bash
 saas-sentry analyze \
   --hr examples/hr.csv \
   --usage examples/usage.csv \
   --billing examples/billing.csv \
+  --config config.example.toml \
   --as-of 2026-10-04 \
-  --output-csv findings.csv
+  --output-csv findings.csv \
+  --quality-csv data-quality.csv
 ```
 
-Example terminal output:
+The command prints annualized candidate cost, contract-adjusted annual opportunity, and estimated savings realizable in the next 12 months. Use `saas-sentry analyze --help` for all options. Exit status is `0` on successful analysis and `2` when an input or configuration cannot be read or validated.
 
-```text
-Potential savings
+## CSV formats
 
-Google Workspace
-1 terminated accounts
-₹9,000/year
-
-Notion
-1 optimization candidates
-₹12,000/year
-
-Slack
-1 inactive users
-₹12,000/year
-
-Total potential annual savings: ₹33,000
-Active licenses analyzed: 4
-```
-
-Use `saas-sentry analyze --help` to see all command-line options. The command exits with status `0` when analysis succeeds and `2` when an input file cannot be read or validated.
-
-## Input CSV formats
-
-Column names are case-sensitive and must match the names shown below. Extra columns are allowed. Save files as UTF-8; a UTF-8 BOM is also accepted.
+Column names are case-sensitive. Extra columns are allowed. Files may be UTF-8 or UTF-8 with BOM.
 
 ### HR roster (`--hr`)
 
-Required columns: `employee,email,status`.
-
-`status` must be `active` or `terminated` (case-insensitive). Email must not be blank and must be unique in the roster.
+Required headers: `employee,status`; each row must include at least one of `email` or `employee_id`. Optional `email_aliases` contains aliases separated by semicolons.
 
 ```csv
-employee,email,status
-Alice,alice@company.com,active
-Bob,bob@company.com,active
-John,john@company.com,terminated
-Cara,cara@company.com,active
+employee,employee_id,email,email_aliases,status
+Alice,E001,alice@company.com,,active
+Bob,E002,bob@company.com,robert@company.com,active
+John,E003,john@company.com,,terminated
 ```
+
+Status values are `active` or `terminated`, case-insensitive. Employee IDs are matched case-insensitively after trimming.
 
 ### SaaS usage (`--usage`)
 
-Required columns: `employee,email,application,last_login`. `last_login` must be an ISO calendar date (`YYYY-MM-DD`) or blank. `usage_count` is optional and must be a non-negative whole number when provided. It should represent the same observation period for each row, such as the last 30 days.
+Required headers: `application,last_login`; each row must include at least one of `email` or `employee_id`. `last_login` uses `YYYY-MM-DD` or is blank.
 
-Each normalized email/application pair must be unique.
+Optional columns:
 
-```csv
-employee,email,application,last_login,usage_count
-Alice,alice@company.com,Slack,2026-09-28,42
-Bob,bob@company.com,Slack,2025-11-02,1
-John,john@company.com,Google Workspace,2026-08-01,12
-Cara,cara@company.com,Notion,2026-10-01,2
-```
-
-### License billing (`--billing`)
-
-Required columns: `email,application,license_status,annual_cost`.
-
-- `license_status` must be `active` or `inactive` (case-insensitive).
-- `annual_cost` is the annual cost for one user's license, as a non-negative number in INR.
-- Each normalized email/application pair must be unique.
+| Column | Meaning |
+| --- | --- |
+| `usage_count` | Product activity count for the row's usage window. |
+| `active_days` | Number of days with activity in the usage window. |
+| `usage_window_days` | Window represented by this row; defaults to configuration. |
+| `features_used` | Count of distinct features used; included as evidence in findings. |
+| `employee` | Display name from the usage source. |
 
 ```csv
-email,application,license_status,annual_cost
-alice@company.com,Slack,active,12000
-bob@company.com,Slack,active,12000
-john@company.com,Google Workspace,active,9000
-cara@company.com,Notion,active,12000
+employee_id,email,application,last_login,usage_count,active_days,usage_window_days,features_used
+E001,alice@company.com,Slack,2026-09-28,42,25,30,5
+E002,robert@company.com,Slack,2025-11-02,1,1,30,1
 ```
 
-The billing export supplies license status and cost. Inactive licenses are ignored by the rules. An active billing identity absent from HR is reported as unmatched and excluded from savings rather than being assigned an assumed employment status.
+The employee/application pair must resolve uniquely and occur once in the usage export. Activity counts must be non-negative; active days cannot exceed the window.
+
+### Billing and contract data (`--billing`)
+
+Required headers: `application,license_status,annual_cost`; each row must include at least one of `email` or `employee_id`.
+
+| Column | Meaning |
+| --- | --- |
+| `license_status` | `active` or `inactive`; inactive licenses do not enter rules or active seat counts. |
+| `annual_cost` | Annual per-user license price in the row currency. |
+| `currency` | ISO currency code; defaults to `[currency].default_currency`. |
+| `contract_id` | Contract grouping key; defaults to application. Use a distinct ID for separate agreements. |
+| `renewal_date` | Next date on which seat reductions can take effect (`YYYY-MM-DD`). |
+| `seat_minimum` | Contract-wide minimum paid active seats; repeat the same value on each row in a contract. Defaults to zero. |
+
+```csv
+employee_id,email,application,license_status,annual_cost,currency,contract_id,renewal_date,seat_minimum
+E001,alice@company.com,Slack,active,12000,INR,slack-annual,2026-11-15,1
+E002,robert@company.com,Slack,active,12000,INR,slack-annual,2026-11-15,1
+```
+
+Employee/application pairs must be unique. A consistent `seat_minimum` is required for all rows sharing a contract ID.
 
 ## Rules and configuration
 
-Rules are evaluated in this order. An active license is assigned to the first matching rule only.
+Copy `config.example.toml` and change the thresholds and exchange rates to your organization's settings:
 
-| Priority | Condition | Finding | Default annual savings estimate |
-| --- | --- | --- | --- |
-| 1 | HR status is `terminated` and billing license status is `active` | `terminated` — recommend reclaim | Full annual license cost |
-| 2 | Active license has no usage record, a blank last login, or a last login more than 90 days ago | `inactive` — investigate or reclaim | Full annual license cost |
-| 3 | Active license costs more than ₹10,000/year and usage count is below 5 | `optimization` — review the plan or seat | Full annual license cost |
+```toml
+[rules]
+stale_days = 90
+cost_threshold_inr = 10000
+low_usage_threshold = 5
+low_active_day_ratio = 0.10
+low_features_used_threshold = 2
 
-Set thresholds to match your organization's policy:
+[usage]
+window_days = 30
+
+[currency]
+default_currency = "INR"
+rate_date = "2026-10-01"
+rates_to_inr = { INR = 1, USD = 85, EUR = 92 }
+```
+
+`rates_to_inr` gives INR per one unit of the named currency. Include a dated rate whenever any non-INR currency is configured. Billing rows may override the default currency using their `currency` column. INR is always available at a rate of 1.
+
+| Rule priority | Condition | Finding category |
+| --- | --- | --- |
+| 1 | Employee is terminated and license is active. | `terminated` |
+| 2 | Active license has no usage row, blank login, or login older than `stale_days`. | `inactive` |
+| 3 | Annual cost exceeds `cost_threshold_inr` and the active-day share is below `low_active_day_ratio`, distinct feature count is below `low_features_used_threshold`, or usage count is below `low_usage_threshold`. | `optimization` |
+
+Active-day share is `active_days / usage_window_days`, so different observation windows can be compared. Rule settings may be overridden for one run with `--stale-days`, `--cost-threshold`, `--low-usage-threshold`, `--low-active-day-ratio`, `--low-features-used-threshold`, and `--usage-window-days`. `--as-of` makes stale checks and renewal calculations reproducible.
+
+## Review workflow
+
+First write findings to CSV so each candidate has a stable `finding_id`. Record or update a decision in the local ledger:
 
 ```bash
+saas-sentry review set \
+  --file reviews.csv \
+  --finding-id 0123456789abcdef \
+  --status confirmed \
+  --owner "FinOps" \
+  --note "Remove at renewal after owner sign-off" \
+  --reviewed-on 2026-10-04
+```
+
+Valid statuses are `confirmed`, `dismissed`, and `deferred`. List saved decisions with `saas-sentry review list --file reviews.csv`. Include review state in a later analysis using `--review-file reviews.csv`; the findings CSV then carries status, owner, rationale, and review date. Each finding stores the latest decision; changing a decision replaces that finding's current ledger row.
+
+## Savings estimates
+
+The report separates three amounts:
+
+- **Annualized candidate cost:** face value of all flagged seats, before contract limits.
+- **Contract-adjusted annual opportunity:** highest-cost candidate seats up to the active-seat count above each contract's minimum.
+- **Estimated realizable in next 12 months:** contract-adjusted opportunity prorated from each seat's next renewal date through the following year.
+
+When a renewal date is absent, the estimate assumes a seat reduction can start on the analysis date. Costs are rounded to INR cents after conversion. Estimates do not model taxes, discounts, billing refunds, co-termination, or negotiated terms, and do not guarantee realized savings. Confirm findings with application owners and Finance before changing a subscription.
+
+## Data quality and privacy
+
+Use `--quality-csv data-quality.csv` to get row references and details for unmatched identities, conflicting IDs/emails, email collisions, and candidate seats blocked by contract minimums. Conflicting records are excluded from findings; an unknown ID paired with a matching email may still match by email and is reported as a warning. Correct upstream exports and rerun analysis.
+
+SaaS Sentry reads the specified local CSVs and writes only requested outputs. It has no network/API integrations, database, or account-changing behavior. Do not use real employee data in public issues, examples, or pull requests.
+
+## CI and development
+
+Run the same core checks locally:
+
+```bash
+python -m compileall -q src tests
+python -m unittest discover -s tests -v
 saas-sentry analyze \
-  --hr hr.csv \
-  --usage usage.csv \
-  --billing billing.csv \
-  --stale-days 60 \
-  --cost-threshold 15000 \
-  --low-usage-threshold 3
+  --hr examples/hr.csv --usage examples/usage.csv --billing examples/billing.csv \
+  --config config.example.toml --as-of 2026-10-04 \
+  --output-csv findings.csv --quality-csv data-quality.csv
 ```
 
-| Option | Default | Meaning |
-| --- | ---: | --- |
-| `--stale-days` | `90` | Flag a login only when it is more than this many days old. |
-| `--cost-threshold` | `10000` | Cost must be greater than this annual INR amount for the low-usage rule. |
-| `--low-usage-threshold` | `5` | Usage count must be less than this number for the low-usage rule. |
-| `--as-of` | Local current date | Analysis date in `YYYY-MM-DD` format. Set this to reproduce stale-login results. |
-| `--output-csv` | Not written | Optional path for the detailed candidate CSV. |
-
-A login exactly N days before the analysis date is not stale when `--stale-days N`. A usage count exactly equal to `--low-usage-threshold` is not low. The annual cost threshold is also strict: a license costing exactly the threshold is not flagged by the low-usage rule.
-
-## Understanding the report
-
-The terminal report groups candidate counts and estimated savings by application and finding category. The optional findings CSV has these columns:
-
-```text
-employee,email,application,category,reason,annual_savings_inr
-```
-
-Savings are estimated by summing the full annual cost for each candidate license. They are not a prediction of realized cash savings: contract terms, seat minimums, billing periods, taxes, and negotiated discounts can change the amount actually recovered. Confirm a finding with the application owner and billing team before acting.
-
-## Data handling and validation
-
-- The tool reads the supplied local CSV files and writes only the requested findings CSV.
-- It makes no network requests and does not connect to SaaS services.
-- It does not store data in a database or change account state.
-- Invalid dates, costs, statuses, usage counts, missing required columns, and duplicate identities stop analysis with a file and row-oriented error where available.
-- Duplicate identities are rejected to prevent ambiguous joins and accidental double-counting.
-- Billing identities without an HR match are omitted from savings and surfaced as an unmatched count.
-
-## Project structure
-
-```text
-.
-├── examples/                 # Small HR, usage, and billing CSV exports
-├── src/saas_sentry/
-│   ├── cli.py                 # Argument parsing and command entry point
-│   └── engine.py              # CSV validation, identity matching, and rules
-├── LICENSE
-├── README.md
-└── pyproject.toml
-```
+GitHub Actions runs these validations on Python 3.11, 3.12, and 3.13 for pushes and pull requests.
 
 ## Roadmap
 
-Potential follow-on work includes provider-specific exports or API connectors for Google Workspace, Microsoft 365, Slack, GitHub, Zoom, and Atlassian; support for additional currencies; configurable usage windows; and a review workflow for approving recommendations. These are future directions, not capabilities included in the current CLI.
-
-## Contributing
-
-Contributions and bug reports are welcome. For a code change:
-
-1. Open an issue or discussion describing the problem or proposed behavior.
-2. Create a focused branch and keep changes aligned with the documented CSV schemas and rule behavior.
-3. Include or update example data and documentation when input or output behavior changes.
-4. Run the CLI against the example CSVs and inspect the generated report before opening a pull request.
-
-Please do not include real employee, usage, or billing data in issues, example files, or pull requests. Use synthetic records instead.
+Provider-specific Google Workspace, Microsoft 365, Slack, GitHub, Zoom, and Atlassian imports can be added on top of these canonical CSV contracts. Additional directions include richer contract proration and review history.
 
 ## License
 
-SaaS Sentry is available under the [MIT License](LICENSE).
+MIT. See [LICENSE](LICENSE).

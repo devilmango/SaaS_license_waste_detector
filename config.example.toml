@@ -1,0 +1,14 @@
+[rules]
+stale_days = 90
+cost_threshold_inr = 10000
+low_usage_threshold = 5
+low_active_day_ratio = 0.10
+low_features_used_threshold = 2
+
+[usage]
+window_days = 30
+
+[currency]
+default_currency = "INR"
+rate_date = "2026-10-01"
+rates_to_inr = { INR = 1, USD = 85, EUR = 92, GBP = 108 }
