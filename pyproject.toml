@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "saas-sentry"
+version = "0.1.0"
+description = "Analyze HR, SaaS usage, and billing CSV exports to detect unused licenses and estimate annual subscription savings."
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{name = "SaaS Sentry contributors"}]
+dependencies = []
+
+[project.scripts]
+saas-sentry = "saas_sentry.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

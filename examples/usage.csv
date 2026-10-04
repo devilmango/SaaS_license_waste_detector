@@ -1,0 +1,5 @@
+employee,email,application,last_login,usage_count
+Alice,alice@company.com,Slack,2026-09-28,42
+Bob,bob@company.com,Slack,2025-11-02,1
+John,john@company.com,Google Workspace,2026-08-01,12
+Cara,cara@company.com,Notion,2026-10-01,2
