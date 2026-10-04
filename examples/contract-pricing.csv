@@ -1,0 +1,6 @@
+contract_id,min_seats,max_seats,annual_cost_per_seat,currency
+slack-annual,1,10,12000,INR
+slack-annual,11,,10000,INR
+workspace-annual,1,,9000,INR
+notion-monthly,1,1,12000,INR
+notion-monthly,2,,11000,INR

@@ -1,5 +1,5 @@
-employee_id,email,application,license_status,annual_cost,currency,contract_id,renewal_date,seat_minimum
-E001,alice@company.com,Slack,active,12000,INR,slack-annual,2026-11-15,1
-E002,robert@company.com,Slack,active,12000,INR,slack-annual,2026-11-15,1
-E003,john@company.com,Google Workspace,active,9000,INR,workspace-annual,2026-11-15,1
-E004,cara@company.com,Notion,active,12000,INR,notion-monthly,2026-10-15,0
+employee_id,email,application,license_status,annual_cost,currency,contract_id,renewal_date,seat_minimum,commitment_end_date,notice_days,bundle_group
+E001,alice@company.com,Slack,active,12000,INR,slack-annual,2026-11-15,1,2026-11-15,30,
+E002,robert@company.com,Slack,active,12000,INR,slack-annual,2026-11-15,1,2026-11-15,30,
+E003,john@company.com,Google Workspace,active,9000,INR,workspace-annual,2026-11-15,1,2027-03-31,90,
+E004,cara@company.com,Notion,active,12000,INR,notion-monthly,2026-10-15,0,2026-10-15,30,

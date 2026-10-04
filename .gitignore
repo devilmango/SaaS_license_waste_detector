@@ -5,3 +5,11 @@ __pycache__/
 dist/
 build/
 .coverage
+reviews.csv
+snapshots/
+reports/
+imports/
+findings.csv
+data-quality.csv
+report.json
+report.html

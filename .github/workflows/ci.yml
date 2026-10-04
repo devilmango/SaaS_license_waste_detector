@@ -36,7 +36,22 @@ jobs:
           --hr examples/hr.csv
           --usage examples/usage.csv
           --billing examples/billing.csv
+          --contract-pricing examples/contract-pricing.csv
           --config config.example.toml
           --as-of 2026-10-04
           --output-csv findings.csv
           --quality-csv data-quality.csv
+          --output-json report.json
+          --output-html report.html
+          --snapshot-dir snapshots
+
+      - name: Run scheduled report once
+        run: >-
+          saas-sentry watch
+          --hr examples/hr.csv
+          --usage examples/usage.csv
+          --billing examples/billing.csv
+          --contract-pricing examples/contract-pricing.csv
+          --config config.example.toml
+          --output-dir scheduled-reports
+          --once

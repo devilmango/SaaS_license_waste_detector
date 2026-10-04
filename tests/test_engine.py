@@ -19,6 +19,7 @@ from saas_sentry.engine import (
     load_reviews,
     update_review,
 )
+from saas_sentry.reports import compare_snapshots, list_snapshots, render_html, report_payload, write_snapshot
 
 
 class SaaSSentryTests(unittest.TestCase):
@@ -92,6 +93,50 @@ class SaaSSentryTests(unittest.TestCase):
         self.assertEqual(sum((f.realizable_12m_inr for f in result.findings), Decimal("0")), Decimal("21238.36"))
         self.assertTrue(any(issue.issue == "seat_minimum_limit" for issue in result.issues))
 
+    def test_contract_tiers_notice_period_and_bundle_constraints(self) -> None:
+        self.write_csv(self.hr, ["employee", "employee_id", "email", "status"], [
+            ["Alice", "A-1", "alice@example.com", "active"],
+            ["Bob", "B-2", "bob@example.com", "active"],
+        ])
+        self.write_csv(self.usage, ["employee_id", "email", "application", "last_login"], [
+            ["A-1", "alice@example.com", "Editor", "2026-10-01"],
+            ["B-2", "bob@example.com", "Editor", "2025-10-01"],
+        ])
+        self.write_csv(self.billing, [
+            "employee_id", "email", "application", "license_status", "annual_cost", "contract_id",
+            "renewal_date", "seat_minimum", "commitment_end_date", "notice_days",
+        ], [
+            ["A-1", "alice@example.com", "Editor", "active", "100", "editors", "2026-11-15", "0", "2027-03-31", "90"],
+            ["B-2", "bob@example.com", "Editor", "active", "100", "editors", "2026-11-15", "0", "2027-03-31", "90"],
+        ])
+        pricing = self.root / "tiers.csv"
+        self.write_csv(pricing, ["contract_id", "min_seats", "max_seats", "annual_cost_per_seat"], [
+            ["editors", "0", "1", "80"], ["editors", "2", "", "100"],
+        ])
+        data = load_inputs(self.hr, self.usage, self.billing, contract_pricing_path=pricing)
+        result = analyze(data, as_of=date(2026, 10, 4))
+        finding = result.findings[0]
+        self.assertEqual(finding.opportunity_savings_inr, Decimal("120.00"))
+        self.assertEqual(finding.savings_effective_date, date(2027, 3, 31))
+        self.assertEqual(finding.realizable_12m_inr, Decimal("61.48"))
+
+    def test_bundle_requires_all_assigned_products_to_be_reclaimable(self) -> None:
+        self.write_csv(self.hr, ["employee", "employee_id", "email", "status"], [
+            ["Alice", "A-1", "alice@example.com", "active"],
+        ])
+        self.write_csv(self.usage, ["employee_id", "email", "application", "last_login"], [
+            ["A-1", "alice@example.com", "Product B", "2026-10-01"],
+        ])
+        self.write_csv(self.billing, ["employee_id", "email", "application", "license_status", "annual_cost", "bundle_group"], [
+            ["A-1", "alice@example.com", "Product A", "active", "100", "suite"],
+            ["A-1", "alice@example.com", "Product B", "active", "100", "suite"],
+        ])
+        data = load_inputs(self.hr, self.usage, self.billing)
+        result = analyze(data, as_of=date(2026, 10, 4))
+        self.assertEqual(len(result.findings), 1)
+        self.assertEqual(result.findings[0].opportunity_savings_inr, Decimal("0"))
+        self.assertTrue(any(issue.issue == "bundle_constraint" for issue in result.issues))
+
     def test_conflicting_identity_is_reported_and_excluded(self) -> None:
         self.basic_inputs()
         self.write_csv(self.billing, ["employee_id", "email", "application", "license_status", "annual_cost"], [
@@ -155,6 +200,22 @@ class SaaSSentryTests(unittest.TestCase):
         self.assertEqual(rules.low_active_day_ratio, Decimal("0.15"))
         self.assertEqual(rules.default_usage_window_days, 14)
         self.assertEqual(currency.rate_date, date(2026, 10, 1))
+
+    def test_snapshots_are_listed_and_comparable_and_html_is_escaped(self) -> None:
+        self.basic_inputs()
+        currency = CurrencyConfig("USD", date(2026, 10, 1), {"INR": Decimal("1"), "USD": Decimal("80")})
+        result = analyze(load_inputs(self.hr, self.usage, self.billing, currency=currency),
+                         as_of=date(2026, 10, 4), currency=currency)
+        payload = report_payload(result, as_of=date(2026, 10, 4), source_paths=[self.hr, self.usage, self.billing])
+        snapshots = self.root / "snapshots"
+        write_snapshot(snapshots, payload)
+        write_snapshot(snapshots, payload)
+        self.assertEqual(len(list_snapshots(snapshots)), 2)
+        comparison = compare_snapshots(payload, payload)
+        self.assertEqual(comparison["added_finding_ids"], [])
+        self.assertEqual(comparison["contract_adjusted_annual_opportunity_delta_inr"], "0.00")
+        payload["findings"][0]["employee"] = "<script>alert(1)</script>"
+        self.assertIn("&lt;script&gt;", render_html(payload))
 
 
 if __name__ == "__main__":

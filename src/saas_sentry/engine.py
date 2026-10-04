@@ -48,6 +48,9 @@ class License:
     contract_id: str
     renewal_date: date | None
     seat_minimum: int
+    commitment_end_date: date | None
+    notice_days: int
+    bundle_group: str
     source_row: int
 
 
@@ -66,6 +69,14 @@ class InputData:
     usage: dict[tuple[str, str], Usage]
     licenses: tuple[License, ...]
     issues: tuple[DataIssue, ...]
+    price_tiers: dict[str, tuple["ContractTier", ...]]
+
+
+@dataclass(frozen=True)
+class ContractTier:
+    min_seats: int
+    max_seats: int | None
+    annual_cost_per_seat_inr: Decimal
 
 
 @dataclass(frozen=True)
@@ -106,6 +117,10 @@ class Finding:
     opportunity_savings_inr: Decimal = Decimal("0")
     realizable_12m_inr: Decimal = Decimal("0")
     renewal_date: date | None = None
+    commitment_end_date: date | None = None
+    notice_days: int = 0
+    bundle_group: str = ""
+    savings_effective_date: date | None = None
     evidence: str = ""
 
 
@@ -205,6 +220,7 @@ def load_inputs(
     *,
     currency: CurrencyConfig | None = None,
     default_usage_window_days: int = 30,
+    contract_pricing_path: Path | None = None,
 ) -> InputData:
     """Load CSV exports and resolve identity by employee ID, email, and aliases."""
     currency = currency or CurrencyConfig()
@@ -291,6 +307,7 @@ def load_inputs(
     licenses: list[License] = []
     seen: set[tuple[str, str]] = set()
     contract_minimums: dict[str, int] = {}
+    contract_terms: dict[str, tuple[int, date | None, date | None, int]] = {}
     for line, row in enumerate(billing_rows, start=2):
         email, employee_id, app = row.get("email", ""), row.get("employee_id", ""), row.get("application", "")
         if not app:
@@ -318,6 +335,14 @@ def load_inputs(
         if contract_key in contract_minimums and contract_minimums[contract_key] != minimum:
             raise InputError(f"{billing_path}:{line}: seat_minimum conflicts with other rows for contract {contract_id!r}")
         contract_minimums[contract_key] = minimum
+        renewal_date = _parse_date(row.get("renewal_date", ""), billing_path, line, "renewal_date")
+        commitment_end = _parse_date(row.get("commitment_end_date", ""), billing_path, line, "commitment_end_date")
+        notice_days = _parse_int(row.get("notice_days", ""), billing_path, line, "notice_days", default=0)
+        assert notice_days is not None
+        terms = (minimum, renewal_date, commitment_end, notice_days)
+        if contract_key in contract_terms and contract_terms[contract_key] != terms:
+            raise InputError(f"{billing_path}:{line}: contract terms conflict across rows for {contract_id!r}")
+        contract_terms[contract_key] = terms
         unique_identity = person.key if person else _normalize_id(employee_id) or normalize_email(email)
         pair_key = (unique_identity, app.casefold())
         if pair_key in seen:
@@ -325,13 +350,36 @@ def load_inputs(
         seen.add(pair_key)
         annual_cost = _parse_money(row.get("annual_cost", ""), billing_path, line)
         annual_cost_inr = currency.convert(annual_cost, row.get("currency", ""), billing_path, line)
-        renewal_date = _parse_date(row.get("renewal_date", ""), billing_path, line, "renewal_date")
+        bundle_group = row.get("bundle_group", "")
         licenses.append(License(
             person.key if person else None,
             email or (person.email if person else ""), employee_id, app, status,
-            annual_cost_inr, contract_id, renewal_date, minimum, line,
+            annual_cost_inr, contract_id, renewal_date, minimum, commitment_end,
+            notice_days, bundle_group, line,
         ))
-    return InputData(people, usage, tuple(licenses), tuple(issues))
+    price_tiers: dict[str, tuple[ContractTier, ...]] = {}
+    if contract_pricing_path:
+        tier_rows = _rows(contract_pricing_path, {"contract_id", "min_seats", "annual_cost_per_seat"})
+        collected: dict[str, list[ContractTier]] = {}
+        for line, row in enumerate(tier_rows, start=2):
+            contract_id = row.get("contract_id", "")
+            if not contract_id:
+                raise InputError(f"{contract_pricing_path}:{line}: contract_id cannot be blank")
+            minimum = _parse_int(row.get("min_seats", ""), contract_pricing_path, line, "min_seats", default=0)
+            maximum = _parse_int(row.get("max_seats", ""), contract_pricing_path, line, "max_seats")
+            assert minimum is not None
+            if maximum is not None and maximum < minimum:
+                raise InputError(f"{contract_pricing_path}:{line}: max_seats must be at least min_seats")
+            cost = _parse_money(row.get("annual_cost_per_seat", ""), contract_pricing_path, line)
+            cost_inr = currency.convert(cost, row.get("currency", ""), contract_pricing_path, line)
+            collected.setdefault(contract_id.casefold(), []).append(ContractTier(minimum, maximum, cost_inr))
+        for contract_id, tiers in collected.items():
+            ordered = sorted(tiers, key=lambda tier: tier.min_seats)
+            for previous, current in zip(ordered, ordered[1:]):
+                if previous.max_seats is None or current.min_seats <= previous.max_seats:
+                    raise InputError(f"{contract_pricing_path}: overlapping price tiers for contract {contract_id!r}")
+            price_tiers[contract_id] = tuple(ordered)
+    return InputData(people, usage, tuple(licenses), tuple(issues), price_tiers)
 
 
 def load_config(path: Path | None) -> tuple[Rules, CurrencyConfig]:
@@ -433,7 +481,9 @@ def analyze(
         finding = Finding(
             finding_id, person.employee, person.email or license.email, person.employee_id,
             license.application, license.contract_id, category, reason,
-            license.annual_cost_inr, renewal_date=license.renewal_date, evidence=evidence,
+            license.annual_cost_inr, renewal_date=license.renewal_date,
+            commitment_end_date=license.commitment_end_date, notice_days=license.notice_days,
+            bundle_group=license.bundle_group, evidence=evidence,
         )
         candidates.append((finding, license))
 
@@ -444,8 +494,7 @@ def analyze(
     for candidate in candidates:
         candidates_by_contract.setdefault(candidate[1].contract_id.casefold(), []).append(candidate)
 
-    updated: list[Finding] = []
-    horizon = today + timedelta(days=365)
+    selected_by_contract: dict[str, set[str]] = {}
     for contract_key, contract_candidates in candidates_by_contract.items():
         contract_licenses = by_contract[contract_key]
         floor = max((license.seat_minimum for license in contract_licenses), default=0)
@@ -456,17 +505,88 @@ def analyze(
                 f"{len(contract_candidates)} candidate seats but only {removable_seats} seats can be removed above the {floor}-seat minimum.",
             ))
         eligible = sorted(contract_candidates, key=lambda item: item[1].annual_cost_inr, reverse=True)
-        selected = {finding.finding_id for finding, _ in eligible[:removable_seats]}
+        selected_by_contract[contract_key] = {finding.finding_id for finding, _ in eligible[:removable_seats]}
+
+    bundle_licenses: dict[tuple[str, str], list[License]] = {}
+    for license in active_licenses:
+        if license.person_key and license.bundle_group:
+            bundle_licenses.setdefault((license.person_key, license.bundle_group.casefold()), []).append(license)
+    candidate_license_by_id = {finding.finding_id: license for finding, license in candidates}
+    id_by_license = {
+        (license.person_key, license.application.casefold()): finding.finding_id
+        for finding, license in candidates if license.person_key
+    }
+    for (person_key, bundle_key), bundled_licenses in bundle_licenses.items():
+        candidate_ids = [
+            id_by_license.get((person_key, license.application.casefold())) for license in bundled_licenses
+        ]
+        candidate_ids = [finding_id for finding_id in candidate_ids if finding_id]
+        selected_ids = [
+            finding_id for finding_id in candidate_ids
+            if finding_id in selected_by_contract.get(candidate_license_by_id[finding_id].contract_id.casefold(), set())
+        ]
+        if candidate_ids and len(selected_ids) != len(bundled_licenses):
+            for finding_id in selected_ids:
+                license = candidate_license_by_id[finding_id]
+                selected_by_contract[license.contract_id.casefold()].discard(finding_id)
+            issues.append(DataIssue(
+                "billing", "bundle", bundle_key, "bundle_constraint",
+                "Savings are not counted unless all active licenses for this person in the bundle are reclaimable.",
+            ))
+
+    def tier_for_seats(contract_key: str, seats: int) -> ContractTier | None:
+        return next((tier for tier in data.price_tiers.get(contract_key, ())
+                     if tier.min_seats <= seats and (tier.max_seats is None or seats <= tier.max_seats)), None)
+
+    updated: list[Finding] = []
+    horizon = today + timedelta(days=365)
+    for contract_key, contract_candidates in candidates_by_contract.items():
+        contract_licenses = by_contract[contract_key]
+        selected_ids = selected_by_contract[contract_key]
+        selected_candidates = sorted(
+            ((finding, license) for finding, license in contract_candidates if finding.finding_id in selected_ids),
+            key=lambda item: item[1].annual_cost_inr, reverse=True,
+        )
+        remove_count = len(selected_candidates)
+        baseline_total = sum((license.annual_cost_inr for license in contract_licenses), Decimal("0"))
+        projected_total = max(Decimal("0"), baseline_total - sum((license.annual_cost_inr for _, license in selected_candidates), Decimal("0")))
+        if contract_key in data.price_tiers:
+            current_tier = tier_for_seats(contract_key, len(contract_licenses))
+            remaining_tier = tier_for_seats(contract_key, len(contract_licenses) - remove_count)
+            if not current_tier or (len(contract_licenses) > remove_count and not remaining_tier):
+                raise InputError(f"No configured contract price tier covers the current or projected seat count for {contract_key!r}")
+            baseline_total = current_tier.annual_cost_per_seat_inr * len(contract_licenses)
+            remaining = len(contract_licenses) - remove_count
+            projected_total = remaining_tier.annual_cost_per_seat_inr * remaining if remaining_tier and remaining else Decimal("0")
+        total_opportunity = max(Decimal("0"), baseline_total - projected_total)
+        weight_total = sum((license.annual_cost_inr for _, license in selected_candidates), Decimal("0"))
+        allocations: dict[str, Decimal] = {}
+        unallocated = total_opportunity
+        for index, (finding, license) in enumerate(selected_candidates):
+            if index == len(selected_candidates) - 1:
+                amount = unallocated
+            elif weight_total:
+                amount = (total_opportunity * license.annual_cost_inr / weight_total).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP
+                )
+            else:
+                amount = Decimal("0")
+            allocations[finding.finding_id] = amount
+            unallocated -= amount
         for finding, license in contract_candidates:
-            opportunity = license.annual_cost_inr if finding.finding_id in selected else Decimal("0")
-            effective = license.renewal_date or today
+            opportunity = allocations.get(finding.finding_id, Decimal("0"))
+            effective = max((day for day in (license.renewal_date, license.commitment_end_date) if day), default=today)
+            if license.notice_days and today > effective - timedelta(days=license.notice_days):
+                effective += timedelta(days=365)
+            effective = max(today, effective)
             remaining_days = max(0, (horizon - max(today, effective)).days)
             realizable = (opportunity * Decimal(remaining_days) / Decimal(365)).quantize(
                 Decimal("0.01"), rounding=ROUND_HALF_UP
             )
             updated.append(Finding(
                 **{**finding.__dict__, "opportunity_savings_inr": opportunity,
-                   "realizable_12m_inr": realizable}
+                   "realizable_12m_inr": realizable,
+                   "savings_effective_date": effective}
             ))
     updated.sort(key=lambda item: (item.application.casefold(), item.category, item.email.casefold()))
     active_count = len(active_licenses)
@@ -532,8 +652,9 @@ def format_findings_csv(
         "finding_id", "employee", "employee_id", "email", "application", "contract_id",
         "category", "reason", "evidence", "annualized_candidate_cost_inr",
         "contract_adjusted_annual_opportunity_inr", "estimated_realizable_12m_inr",
-        "renewal_date", "currency_rate_date", "review_status", "review_owner", "review_note",
-        "reviewed_on",
+        "renewal_date", "commitment_end_date", "notice_days", "bundle_group",
+        "savings_effective_date", "currency_rate_date", "review_status", "review_owner",
+        "review_note", "reviewed_on",
     ])
     for finding in analysis.findings:
         review = reviews.get(finding.finding_id, {})
@@ -543,6 +664,9 @@ def format_findings_csv(
             finding.evidence, f"{finding.annualized_cost_inr:.2f}",
             f"{finding.opportunity_savings_inr:.2f}", f"{finding.realizable_12m_inr:.2f}",
             finding.renewal_date.isoformat() if finding.renewal_date else "",
+            finding.commitment_end_date.isoformat() if finding.commitment_end_date else "",
+            finding.notice_days, finding.bundle_group,
+            finding.savings_effective_date.isoformat() if finding.savings_effective_date else "",
             analysis.currency_rate_date.isoformat() if analysis.currency_rate_date else "",
             review.get("status", "unreviewed"), review.get("owner", ""),
             review.get("note", ""), review.get("reviewed_on", ""),
