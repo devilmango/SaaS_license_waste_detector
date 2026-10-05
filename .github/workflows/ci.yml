@@ -54,6 +54,24 @@ jobs:
           --output focus-spend.csv
           --config config.example.toml
 
+      - name: Validate portfolio reconciliation, discovery, and forecast reports
+        run: |
+          saas-sentry reconcile \
+            --hr examples/hr.csv --usage examples/usage.csv \
+            --billing examples/billing.csv --contract-pricing examples/contract-pricing.csv \
+            --focus focus-spend.csv --config config.example.toml \
+            --output reconciliation.csv
+          saas-sentry discover \
+            --hr examples/hr.csv --usage examples/usage.csv \
+            --billing examples/billing.csv --inventory examples/application-inventory.csv \
+            --config config.example.toml --output portfolio-discovery.csv
+          saas-sentry forecast \
+            --hr examples/hr.csv --usage examples/usage.csv \
+            --billing examples/billing.csv --contract-pricing examples/contract-pricing.csv \
+            --config config.example.toml --price-increase-percent 8 \
+            --seat-growth-percent 12 --seat-reduction-percent 10 \
+            --output renewal-forecast.csv
+
       - name: Validate provider and action CLI help
         run: |
           saas-sentry connect google-workspace --help

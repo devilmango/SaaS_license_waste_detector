@@ -37,6 +37,14 @@ from .engine import (
 )
 from .reports import compare_snapshots, list_snapshots, read_snapshot, render_html, report_payload, write_snapshot
 from .focus import format_focus_spend, load_focus_spend
+from .portfolio import (
+    discover_portfolio,
+    format_discovery,
+    format_forecast,
+    format_reconciliation,
+    forecast_renewals,
+    reconcile_focus,
+)
 
 
 def _money(value: str) -> Decimal:
@@ -146,6 +154,36 @@ def build_parser() -> argparse.ArgumentParser:
     focus_import.add_argument("--output", type=Path, required=True, help="normalized spend CSV destination")
     focus_import.add_argument("--config", type=Path, help="currency conversion rates and effective date")
     focus_import.add_argument("--cost-center-tag", default="cost_center", help="FOCUS Tags key for cost center")
+
+    reconciliation = subparsers.add_parser("reconcile", help="compare FOCUS actual spend to assigned-license cost")
+    reconciliation.add_argument("--hr", type=Path, required=True)
+    reconciliation.add_argument("--usage", type=Path, required=True)
+    reconciliation.add_argument("--billing", type=Path, required=True)
+    reconciliation.add_argument("--focus", type=Path, required=True, help="normalized CSV from focus import")
+    reconciliation.add_argument("--contract-pricing", type=Path)
+    reconciliation.add_argument("--config", type=Path)
+    reconciliation.add_argument("--tolerance-percent", type=_money, default=Decimal("5"))
+    reconciliation.add_argument("--output", type=Path, required=True)
+
+    discovery = subparsers.add_parser("discover", help="identify unmanaged apps and overlapping app categories")
+    discovery.add_argument("--hr", type=Path, required=True)
+    discovery.add_argument("--usage", type=Path, required=True)
+    discovery.add_argument("--billing", type=Path, required=True)
+    discovery.add_argument("--inventory", type=Path, required=True, help="app inventory CSV from SSO/procurement/expense exports")
+    discovery.add_argument("--contract-pricing", type=Path)
+    discovery.add_argument("--config", type=Path)
+    discovery.add_argument("--output", type=Path, required=True)
+
+    forecast = subparsers.add_parser("forecast", help="model renewal spend with seat and price scenarios")
+    forecast.add_argument("--hr", type=Path, required=True)
+    forecast.add_argument("--usage", type=Path, required=True)
+    forecast.add_argument("--billing", type=Path, required=True)
+    forecast.add_argument("--contract-pricing", type=Path)
+    forecast.add_argument("--config", type=Path)
+    forecast.add_argument("--price-increase-percent", type=_money, default=Decimal("0"))
+    forecast.add_argument("--seat-growth-percent", type=_money, default=Decimal("0"))
+    forecast.add_argument("--seat-reduction-percent", type=_money, default=Decimal("0"), help="planned seat reduction before the renewal")
+    forecast.add_argument("--output", type=Path, required=True)
 
     actions = subparsers.add_parser("actions", help="propose, approve, and record completed license reclaims")
     action_commands = actions.add_subparsers(dest="action_command", required=True)
@@ -351,6 +389,54 @@ def _focus_import(args: argparse.Namespace) -> int:
     return 0
 
 
+def _portfolio_inputs(args: argparse.Namespace):
+    _, currency = load_config(args.config)
+    return load_inputs(
+        args.hr, args.usage, args.billing, currency=currency,
+        contract_pricing_path=args.contract_pricing,
+    )
+
+
+def _portfolio_output(output: Path, inputs: tuple[Path | None, ...], content: str) -> None:
+    resolved = output.resolve()
+    if resolved in {path.resolve() for path in inputs if path is not None}:
+        raise InputError("report output cannot overwrite an input file")
+    _write_text(output, content)
+
+
+def _reconcile(args: argparse.Namespace) -> int:
+    inputs = _portfolio_inputs(args)
+    rows = reconcile_focus(args.focus, inputs, tolerance_percent=args.tolerance_percent)
+    source_paths = (args.hr, args.usage, args.billing, args.focus, args.contract_pricing, args.config)
+    _portfolio_output(args.output, source_paths, format_reconciliation(rows))
+    print(f"Reconciled {len(rows)} application/cost-center billing groups into {args.output}.")
+    return 0
+
+
+def _discover(args: argparse.Namespace) -> int:
+    inputs = _portfolio_inputs(args)
+    rows = discover_portfolio(args.inventory, inputs)
+    source_paths = (args.hr, args.usage, args.billing, args.inventory, args.contract_pricing, args.config)
+    _portfolio_output(args.output, source_paths, format_discovery(rows))
+    unmanaged = sum("shadow_saas" in row.portfolio_status for row in rows)
+    overlaps = sum("overlap_candidate" in row.portfolio_status for row in rows)
+    print(f"Discovered {len(rows)} apps ({unmanaged} unmanaged, {overlaps} overlap candidates) in {args.output}.")
+    return 0
+
+
+def _forecast(args: argparse.Namespace) -> int:
+    inputs = _portfolio_inputs(args)
+    rows = forecast_renewals(
+        inputs, price_increase_percent=args.price_increase_percent,
+        seat_growth_percent=args.seat_growth_percent,
+        seat_reduction_percent=args.seat_reduction_percent,
+    )
+    source_paths = (args.hr, args.usage, args.billing, args.contract_pricing, args.config)
+    _portfolio_output(args.output, source_paths, format_forecast(rows))
+    print(f"Forecast {len(rows)} active contracts into {args.output}.")
+    return 0
+
+
 def _history(args: argparse.Namespace) -> int:
     snapshots = list_snapshots(args.dir)
     if args.history_command == "list":
@@ -422,6 +508,12 @@ def main() -> int:
             return _connect(args)
         if args.command == "focus":
             return _focus_import(args)
+        if args.command == "reconcile":
+            return _reconcile(args)
+        if args.command == "discover":
+            return _discover(args)
+        if args.command == "forecast":
+            return _forecast(args)
         if args.command == "actions":
             return _actions(args)
         if args.command == "history":

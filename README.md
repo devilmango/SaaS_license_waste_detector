@@ -17,6 +17,9 @@ SaaS Sentry combines HR, usage, and billing data to flag terminated accounts, st
 - Allocate active license spend and modeled savings to departments and cost centers.
 - Build a contract renewal calendar with notice deadlines and upcoming actions.
 - Normalize FinOps Open Cost and Usage Specification (FOCUS) invoice data by service and cost-center tag.
+- Reconcile FOCUS invoice spend to assigned-license costs, flagging variances and unlicensed spend.
+- Discover unmanaged SaaS applications and overlapping apps from a combined procurement/SSO/expense inventory.
+- Forecast renewal costs with seat-growth, reduction, contract-floor, and vendor price-increase scenarios.
 - Import Microsoft 365 directory users, assigned SKUs, and successful sign-in dates through read-only Graph access.
 - Import Google Workspace, Slack, GitHub Copilot, and Zoom license/activity data through provider APIs.
 - Run recurring reports in a foreground scheduler.
@@ -316,6 +319,54 @@ saas-sentry focus import \
 
 The output includes actual billed cost in INR, original billing currency, billing period, and exchange-rate date. It preserves negative adjustments/credits and groups charges with different currencies separately. See the [FOCUS specification](https://focus.finops.org/) for the interoperable cost and usage format.
 
+### Invoice-to-license reconciliation
+
+Normalize the FOCUS bill first, then compare actual spend with expected costs from active license assignments. The report is grouped by application, cost center, and billing period. It identifies above-tolerance variances, spend with no matching active licenses, and active-license spend with no corresponding invoice row. Expected annual seat cost is prorated to the billing-window length. The normalized FOCUS amounts and license costs must use the same currency configuration (INR in the normalized export).
+
+```bash
+saas-sentry focus import --input examples/focus-billing.csv \
+  --output focus-spend.csv --config config.example.toml
+saas-sentry reconcile --hr examples/hr.csv --usage examples/usage.csv \
+  --billing examples/billing.csv --contract-pricing examples/contract-pricing.csv \
+  --focus focus-spend.csv --config config.example.toml \
+  --tolerance-percent 5 --output reconciliation.csv
+```
+
+The `status` column is `matched`, `variance`, `unlicensed_spend`, or `missing_invoice_spend`. The default tolerance is five percent of expected spend. Negative invoice adjustments such as credits are retained in the actual amount and variance.
+
+### Shadow SaaS and overlapping apps
+
+Combine application rows exported from sources such as SSO, procurement, and expense systems into one inventory CSV. Required columns are `application`, `vendor`, `category`, and `source`; `owner` is optional. Repeated app rows merge their vendors, owners, and sources. Apps absent from active license billing are marked `shadow_saas`; applications sharing a category are flagged as overlap candidates for human review. Category matching is exact after case and whitespace normalization, so use a consistent app taxonomy.
+
+```csv
+application,vendor,category,owner,source
+Slack,Slack Technologies,Collaboration,Engineering,SSO
+Mattermost,Mattermost Inc,Collaboration,Engineering,Expense
+Unknown AI Tool,Example Inc,AI assistant,Product,Procurement
+```
+
+```bash
+saas-sentry discover --hr examples/hr.csv --usage examples/usage.csv \
+  --billing examples/billing.csv --inventory examples/application-inventory.csv \
+  --config config.example.toml --output portfolio-discovery.csv
+```
+
+This report is a discovery aid: an inventory row alone does not establish that an app is unauthorized, redundant, or safe to retire.
+
+### Renewal forecast scenarios
+
+Project active contract costs at renewal with percentage assumptions for seat growth, planned seat reduction, and supplier price increases. The forecast applies contract seat minimums after growth and reduction. When contract price tiers are provided, it selects the tier covering the projected seat count; otherwise it uses the current average annual cost per active seat. Forecast percentages are entered as percent values (for example, `8` means 8%).
+
+```bash
+saas-sentry forecast --hr examples/hr.csv --usage examples/usage.csv \
+  --billing examples/billing.csv --contract-pricing examples/contract-pricing.csv \
+  --config config.example.toml --price-increase-percent 8 \
+  --seat-growth-percent 12 --seat-reduction-percent 10 \
+  --output renewal-forecast.csv
+```
+
+The CSV includes current spend, projected seats and spend before reductions, and the reduced-seat scenario. These are planning estimates based on supplied assumptions, not vendor quotes or guaranteed savings.
+
 ## Approval-based reclaim tracking
 
 The action ledger is an append-only local CSV event log. A proposal requires a finding with `review_status=confirmed`. A different person must approve the proposed reclaim before it can be marked reclaimed. Completion records actual annual savings so the variance from the estimate can be reviewed. Rejections are recorded too. The workflow does not revoke provider licenses; all connectors remain import-only.
@@ -357,6 +408,13 @@ saas-sentry analyze --hr examples/hr.csv --usage examples/usage.csv \
   --showback-csv showback.csv --renewals-csv renewals.csv
 saas-sentry focus import --input examples/focus-billing.csv \
   --output focus-spend.csv --config config.example.toml
+saas-sentry reconcile --hr examples/hr.csv --usage examples/usage.csv \
+  --billing examples/billing.csv --focus focus-spend.csv --output reconciliation.csv
+saas-sentry discover --hr examples/hr.csv --usage examples/usage.csv \
+  --billing examples/billing.csv --inventory examples/application-inventory.csv \
+  --output portfolio-discovery.csv
+saas-sentry forecast --hr examples/hr.csv --usage examples/usage.csv \
+  --billing examples/billing.csv --output renewal-forecast.csv
 ```
 
 GitHub Actions runs package install, compilation, unit tests, and an example analysis on Python 3.11, 3.12, and 3.13.
