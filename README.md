@@ -2,7 +2,7 @@
 
 **A local CLI for detecting unused SaaS licenses, reviewing recommendations, and estimating contract-aware savings.**
 
-SaaS Sentry combines HR, usage, and billing data to flag terminated accounts, stale logins, and expensive low-use licenses. It produces transparent findings, data-quality diagnostics, historical comparisons, and reports. CSV analysis stays local; the optional Microsoft 365 connector makes read-only Microsoft Graph requests. SaaS Sentry never assigns or removes licenses.
+SaaS Sentry combines HR, usage, and billing data to flag terminated accounts, stale logins, and expensive low-use licenses. It produces transparent findings, data-quality diagnostics, historical comparisons, cost-center showback, and reports. CSV analysis stays local; provider connectors import data without changing provider state. Reclaim actions require separate approval and are recorded locally.
 
 ## Features
 
@@ -18,13 +18,15 @@ SaaS Sentry combines HR, usage, and billing data to flag terminated accounts, st
 - Build a contract renewal calendar with notice deadlines and upcoming actions.
 - Normalize FinOps Open Cost and Usage Specification (FOCUS) invoice data by service and cost-center tag.
 - Import Microsoft 365 directory users, assigned SKUs, and successful sign-in dates through read-only Graph access.
+- Import Google Workspace, Slack, GitHub Copilot, and Zoom license/activity data through provider APIs.
 - Run recurring reports in a foreground scheduler.
+- Track proposed license reclaims through a separate-approver gate and compare realized savings with the estimate.
 
 ## Architecture
 
 ```text
 HR CSV ─────────────────┐
-Usage CSV or M365 import ┼─> Validate + resolve identity ─> Rules + contract model
+Usage CSV or provider import ┼─> Validate + resolve identity ─> Rules + contract model
 Billing CSV + price map ┘                                  ├─> Findings / quality CSV
                                                            ├─> JSON / HTML report
                                                            ├─> Cost-center showback + renewal calendar
@@ -216,6 +218,63 @@ saas-sentry analyze --hr hr.csv --usage imports/m365/usage.csv \
   --output-csv findings.csv --quality-csv data-quality.csv
 ```
 
+## Additional provider connectors
+
+Each connector writes canonical `usage.csv`, `billing.csv`, and `import.json` files under the requested output directory. It only reads provider business data. Pricing is supplied locally because provider APIs do not expose negotiated annual seat costs. Use least-privilege credentials and store them in a secret manager or environment variables.
+
+### Google Workspace
+
+The connector reads Directory users and license assignments for product/SKU rows in the pricing map. It requires a bearer token in `GOOGLE_WORKSPACE_ACCESS_TOKEN`, authorized for Directory users read access and Enterprise License Manager. Note: Google's `apps.licensing` OAuth scope grants read/write capability, even though SaaS Sentry makes only GET requests. Protect this token as a privileged credential. Assignments are matched to Directory users by primary email. See the [Directory user resource](https://developers.google.com/workspace/admin/directory/reference/rest/v1/users) and [license assignment API](https://developers.google.com/workspace/admin/licensing/reference/rest/v1/licenseAssignments).
+
+Pricing columns: `product_id,sku_id,application,annual_cost` plus optional contract fields from the billing schema.
+
+```bash
+export GOOGLE_WORKSPACE_ACCESS_TOKEN="<short-lived-token>"
+saas-sentry connect google-workspace --pricing examples/google-workspace-pricing.csv \
+  --output-dir imports/google-workspace
+```
+
+### Slack
+
+Slack usage requires `users:read`, `users:read.email`, and `admin.analytics:read`, plus administrator access to daily member analytics. The connector retrieves one member-analytics file per day (90 days by default), derives the latest observed activity date, and counts activity days and events. This is an activity signal, not a login timestamp. Slack documents that `is_billable_seat` may be inaccurate for some self-serve payment arrangements; validate it against the invoice. Daily member analytics are available only on supported Business+/Enterprise plans, with history depending on plan age. See [Slack member analytics](https://api.slack.com/methods/admin.analytics.getFile).
+
+```bash
+export SLACK_ACCESS_TOKEN="<user-token>"
+saas-sentry connect slack --pricing examples/slack-pricing.csv \
+  --output-dir imports/slack --lookback-days 90 --as-of 2026-10-04
+```
+
+Use `--team-id` with an organization token. Pick an `--as-of` date for which analytics are available; the default is yesterday. Pricing is a single row with annual seat cost and optional contract fields.
+
+### GitHub Copilot
+
+This connector covers Copilot Business seats, not general GitHub organization membership. Create a token with read access to the organization's Copilot seats and set `GITHUB_TOKEN`. GitHub's seat response does not provide a dependable HR email, so the required identity map associates GitHub login to `email` and/or `employee_id`. Unmapped seats stop the import. The latest activity comes from `last_activity_at`; IDE activity appears only when telemetry is enabled, and GitHub documents this endpoint as public preview. See [Copilot seat management](https://docs.github.com/en/rest/copilot/copilot-user-management).
+
+```bash
+export GITHUB_TOKEN="<read-scoped-token>"
+saas-sentry connect github-copilot --organization example-org \
+  --pricing examples/github-copilot-pricing.csv \
+  --identity-map examples/github-copilot-identities.csv \
+  --output-dir imports/github-copilot
+```
+
+Identity map columns: `login,email,employee_id` and optional `employee`. Pricing uses one row with `annual_cost`, optional `application`, and contract fields.
+
+### Zoom
+
+Create a Server-to-Server OAuth app with the granular admin user-list read scope (`user:read:list_users:admin`) and set `ZOOM_ACCOUNT_ID`, `ZOOM_CLIENT_ID`, and `ZOOM_CLIENT_SECRET`. The connector obtains an access token, then reads active users. It imports only user type `2` (licensed); basic and unassigned types are skipped. Zoom's `last_login_time` may have a three-day buffer. See the [Zoom users API](https://developers.zoom.us/docs/api/users/).
+
+Pricing columns: `user_type,application,annual_cost` plus optional contract fields. The example maps type `2`.
+
+```bash
+export ZOOM_ACCOUNT_ID="<account-id>"
+export ZOOM_CLIENT_ID="<client-id>"
+export ZOOM_CLIENT_SECRET="<client-secret>"
+saas-sentry connect zoom --pricing examples/zoom-pricing.csv --output-dir imports/zoom
+```
+
+Connectors are independent. Analyze provider exports with the same HR roster. Review product labels and contract IDs before combining datasets to avoid accidental collisions.
+
 ## Snapshots, exports, and scheduling
 
 `--snapshot-dir` saves findings, analysis date, and source/config fingerprints. Snapshots contain employee details; keep them private. List and compare runs by filename/prefix or `latest`:
@@ -257,11 +316,34 @@ saas-sentry focus import \
 
 The output includes actual billed cost in INR, original billing currency, billing period, and exchange-rate date. It preserves negative adjustments/credits and groups charges with different currencies separately. See the [FOCUS specification](https://focus.finops.org/) for the interoperable cost and usage format.
 
+## Approval-based reclaim tracking
+
+The action ledger is an append-only local CSV event log. A proposal requires a finding with `review_status=confirmed`. A different person must approve the proposed reclaim before it can be marked reclaimed. Completion records actual annual savings so the variance from the estimate can be reviewed. Rejections are recorded too. The workflow does not revoke provider licenses; all connectors remain import-only.
+
+```bash
+# Confirm the candidate in the review ledger, then export reviewed findings.
+saas-sentry review set --file reviews.csv --finding-id 0123456789abcdef \
+  --status confirmed --owner FinOps --note "Owner approved reclaim at renewal"
+saas-sentry analyze --hr examples/hr.csv --usage examples/usage.csv \
+  --billing examples/billing.csv --review-file reviews.csv --output-csv findings.csv
+
+# Propose, approve as a different person, then record completion and actual savings.
+saas-sentry actions propose --findings findings.csv --file actions.csv \
+  --finding-id 0123456789abcdef --owner FinOps --proposed-by analyst@example.com
+saas-sentry actions approve --file actions.csv --action-id <ACTION_ID> \
+  --approved-by manager@example.com --note "Approved"
+saas-sentry actions reclaimed --file actions.csv --action-id <ACTION_ID> \
+  --reclaimed-by operator@example.com --actual-annual-savings 12000
+saas-sentry actions list --file actions.csv
+```
+
+The action list reports status, owner, proposer, approver, estimated savings, actual savings, and variance. Keep the ledger access-controlled because it contains employee references and approver identities.
+
 ## Data quality and privacy
 
 `--quality-csv` includes source, row, identity, issue, and remediation detail for unmatched/conflicting records, contract seat floors, and bundles. Conflicting identities are excluded; a unique employee ID or matching email may still resolve with a warning when the other identifier is unknown.
 
-Local CSV analysis makes no network calls. The Microsoft 365 connector requires network access and performs token and Graph GET requests only. Review ledgers, snapshots, and reports may contain employee information; store them with appropriate access controls.
+Local CSV analysis makes no network calls. Provider connectors require network access and do not mutate provider data. Google Workspace's license scope includes write permission even though this connector makes GET requests only. Review ledgers, action logs, snapshots, and reports may contain employee information; store them with appropriate access controls.
 
 ## CI and development
 

@@ -6,6 +6,7 @@ dist/
 build/
 .coverage
 reviews.csv
+actions.csv
 snapshots/
 reports/
 imports/

@@ -54,6 +54,14 @@ jobs:
           --output focus-spend.csv
           --config config.example.toml
 
+      - name: Validate provider and action CLI help
+        run: |
+          saas-sentry connect google-workspace --help
+          saas-sentry connect slack --help
+          saas-sentry connect github-copilot --help
+          saas-sentry connect zoom --help
+          saas-sentry actions --help
+
       - name: Run scheduled report once
         run: >-
           saas-sentry watch

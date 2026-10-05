@@ -13,7 +13,15 @@ from pathlib import Path
 import sys
 import time
 
-from .connectors import ConnectorError, Microsoft365Connector
+from .actions import ActionError, list_actions, propose_action, transition_action
+from .connectors import (
+    ConnectorError,
+    GitHubCopilotConnector,
+    GoogleWorkspaceConnector,
+    Microsoft365Connector,
+    SlackConnector,
+    ZoomConnector,
+)
 from .engine import (
     InputError,
     analyze,
@@ -112,6 +120,25 @@ def build_parser() -> argparse.ArgumentParser:
     microsoft.add_argument("--pricing", type=Path, required=True, help="CSV mapping sku_part_number to annual_cost and contract terms")
     microsoft.add_argument("--output-dir", type=Path, required=True, help="directory for canonical usage.csv and billing.csv")
 
+    google = connectors.add_parser("google-workspace", help="import Workspace users, last logins, and assigned SKUs")
+    google.add_argument("--pricing", type=Path, required=True, help="CSV mapping product_id/sku_id to application and annual_cost")
+    google.add_argument("--output-dir", type=Path, required=True)
+    google.add_argument("--customer", default="my_customer", help="Google Workspace customer ID (default: my_customer)")
+    slack = connectors.add_parser("slack", help="import Slack billable seats and daily member analytics")
+    slack.add_argument("--pricing", type=Path, required=True, help="single-row workspace annual seat pricing CSV")
+    slack.add_argument("--output-dir", type=Path, required=True)
+    slack.add_argument("--lookback-days", type=_nonnegative, default=90)
+    slack.add_argument("--as-of", type=date.fromisoformat, help="latest analytics date (YYYY-MM-DD); defaults to today")
+    slack.add_argument("--team-id", default="", help="workspace ID when using an organization token")
+    github = connectors.add_parser("github-copilot", help="import Copilot seats and recent activity for an organization")
+    github.add_argument("--organization", required=True)
+    github.add_argument("--pricing", type=Path, required=True, help="single-row annual Copilot seat pricing CSV")
+    github.add_argument("--identity-map", type=Path, required=True, help="map GitHub login to HR email and/or employee ID")
+    github.add_argument("--output-dir", type=Path, required=True)
+    zoom = connectors.add_parser("zoom", help="import active licensed Zoom users and last login times")
+    zoom.add_argument("--pricing", type=Path, required=True, help="CSV mapping Zoom user_type to application and annual_cost")
+    zoom.add_argument("--output-dir", type=Path, required=True)
+
     focus = subparsers.add_parser("focus", help="normalize FOCUS billing exports")
     focus_actions = focus.add_subparsers(dest="focus_command", required=True)
     focus_import = focus_actions.add_parser("import", help="aggregate a FOCUS CSV into cost-center spend")
@@ -119,6 +146,33 @@ def build_parser() -> argparse.ArgumentParser:
     focus_import.add_argument("--output", type=Path, required=True, help="normalized spend CSV destination")
     focus_import.add_argument("--config", type=Path, help="currency conversion rates and effective date")
     focus_import.add_argument("--cost-center-tag", default="cost_center", help="FOCUS Tags key for cost center")
+
+    actions = subparsers.add_parser("actions", help="propose, approve, and record completed license reclaims")
+    action_commands = actions.add_subparsers(dest="action_command", required=True)
+    action_list = action_commands.add_parser("list", help="show latest action states from the append-only ledger")
+    action_list.add_argument("--file", type=Path, default=Path("actions.csv"))
+    action_propose = action_commands.add_parser("propose", help="propose a reclaim for a confirmed finding")
+    action_propose.add_argument("--findings", type=Path, required=True)
+    action_propose.add_argument("--file", type=Path, default=Path("actions.csv"))
+    action_propose.add_argument("--finding-id", required=True)
+    action_propose.add_argument("--owner", required=True)
+    action_propose.add_argument("--proposed-by", required=True)
+    action_propose.add_argument("--note", default="")
+    action_propose.add_argument("--proposed-on", type=date.fromisoformat)
+    for event_name, actor_flag in (("approve", "--approved-by"), ("reject", "--rejected-by")):
+        action = action_commands.add_parser(event_name, help=f"{event_name} a proposed reclaim")
+        action.add_argument("--file", type=Path, default=Path("actions.csv"))
+        action.add_argument("--action-id", required=True)
+        action.add_argument(actor_flag, dest="actor", required=True)
+        action.add_argument("--note", default="")
+        action.add_argument("--on", dest="occurred_on", type=date.fromisoformat)
+    action_reclaimed = action_commands.add_parser("reclaimed", help="record an approved reclaim and actual savings")
+    action_reclaimed.add_argument("--file", type=Path, default=Path("actions.csv"))
+    action_reclaimed.add_argument("--action-id", required=True)
+    action_reclaimed.add_argument("--reclaimed-by", dest="actor", required=True)
+    action_reclaimed.add_argument("--actual-annual-savings", type=_money, required=True)
+    action_reclaimed.add_argument("--note", default="")
+    action_reclaimed.add_argument("--on", dest="occurred_on", type=date.fromisoformat)
 
     history = subparsers.add_parser("history", help="list or compare saved analysis snapshots")
     history_actions = history.add_subparsers(dest="history_command", required=True)
@@ -229,7 +283,60 @@ def _connect(args: argparse.Namespace) -> int:
         print(f"Imported {users} Microsoft 365 users and {licenses} license assignments into {args.output_dir}.")
         print("The connector is read-only; use the supplied HR CSV and run analyze on the generated exports.")
         return 0
-    return 2
+    if args.provider == "google-workspace":
+        users, licenses = GoogleWorkspaceConnector.from_environment().import_exports(
+            args.pricing, args.output_dir, customer=args.customer,
+        )
+    elif args.provider == "slack":
+        users, licenses = SlackConnector.from_environment().import_exports(
+            args.pricing, args.output_dir, lookback_days=args.lookback_days,
+            as_of=args.as_of, team_id=args.team_id,
+        )
+    elif args.provider == "github-copilot":
+        users, licenses = GitHubCopilotConnector.from_environment().import_exports(
+            args.organization, args.pricing, args.identity_map, args.output_dir,
+        )
+    elif args.provider == "zoom":
+        users, licenses = ZoomConnector.from_environment().import_exports(args.pricing, args.output_dir)
+    else:
+        return 2
+    print(f"Imported {users} provider users and {licenses} license assignments into {args.output_dir}.")
+    print("Provider data requests are read-only; analyze the generated usage.csv and billing.csv with your HR roster.")
+    return 0
+
+
+def _actions(args: argparse.Namespace) -> int:
+    if args.action_command == "list":
+        writer = csv.writer(sys.stdout)
+        writer.writerow([
+            "action_id", "finding_id", "status", "owner", "proposed_by", "approver",
+            "proposed_on", "updated_on", "estimated_annual_savings_inr",
+            "actual_annual_savings_inr", "variance_inr", "note",
+        ])
+        for action in list_actions(args.file):
+            writer.writerow([
+                action.action_id, action.finding_id, action.status, action.owner,
+                action.proposed_by, action.approver, action.proposed_on, action.updated_on,
+                f"{action.estimated_annual_savings_inr:.2f}",
+                f"{action.actual_annual_savings_inr:.2f}" if action.actual_annual_savings_inr is not None else "",
+                f"{action.variance_inr:.2f}" if action.variance_inr is not None else "", action.note,
+            ])
+        return 0
+    if args.action_command == "propose":
+        action_id = propose_action(
+            args.findings, args.file, args.finding_id, owner=args.owner,
+            proposed_by=args.proposed_by, note=args.note, proposed_on=args.proposed_on,
+        )
+        print(f"Proposed reclaim action {action_id}; approval is required before completion.")
+        return 0
+    event = {"approve": "approved", "reject": "rejected", "reclaimed": "reclaimed"}[args.action_command]
+    transition_action(
+        args.file, args.action_id, event, actor=args.actor, note=args.note,
+        actual_annual_savings_inr=getattr(args, "actual_annual_savings", None),
+        occurred_on=args.occurred_on,
+    )
+    print(f"Recorded {event} for action {args.action_id}.")
+    return 0
 
 
 def _focus_import(args: argparse.Namespace) -> int:
@@ -315,10 +422,12 @@ def main() -> int:
             return _connect(args)
         if args.command == "focus":
             return _focus_import(args)
+        if args.command == "actions":
+            return _actions(args)
         if args.command == "history":
             return _history(args)
         return _watch(args)
-    except (InputError, ConnectorError, OSError, ValueError) as exc:
+    except (InputError, ConnectorError, ActionError, OSError, ValueError) as exc:
         print(f"saas-sentry: error: {exc}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
