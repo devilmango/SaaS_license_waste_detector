@@ -13,7 +13,9 @@ from saas_sentry.engine import (
     Rules,
     analyze,
     format_findings_csv,
+    format_renewals_csv,
     format_quality_csv,
+    format_showback_csv,
     load_config,
     load_inputs,
     load_reviews,
@@ -78,6 +80,32 @@ class SaaSSentryTests(unittest.TestCase):
         self.assertEqual(by_email["cara@example.com"].category, "optimization")
         self.assertEqual(by_email["cara@example.com"].annualized_cost_inr, Decimal("24000.00"))
         self.assertEqual(by_email["cara@example.com"].evidence, "Active days=1/30; features used=1")
+
+    def test_cost_center_showback_and_renewal_calendar(self) -> None:
+        self.basic_inputs()
+        self.write_csv(self.hr, [
+            "employee", "employee_id", "email", "email_aliases", "department", "cost_center", "status",
+        ], [
+            ["Alice", "A-1", "alice@example.com", "ally@example.com", "Engineering", "ENG-100", "active"],
+            ["Bob", "B-2", "bob@example.com", "", "Finance", "FIN-200", "terminated"],
+            ["Cara", "C-3", "cara@example.com", "", "Engineering", "ENG-100", "active"],
+        ])
+        currency = CurrencyConfig("USD", date(2026, 10, 1), {"INR": Decimal("1"), "USD": Decimal("80")})
+        data = load_inputs(self.hr, self.usage, self.billing, currency=currency)
+        result = analyze(data, as_of=date(2026, 10, 4), currency=currency)
+        showback = {(row.department, row.cost_center): row for row in result.showback}
+        engineering = showback[("Engineering", "ENG-100")]
+        finance = showback[("Finance", "FIN-200")]
+        self.assertEqual(engineering.active_license_count, 2)
+        self.assertEqual(engineering.annualized_spend_inr, Decimal("40000.00"))
+        self.assertEqual(engineering.annual_opportunity_inr, Decimal("24000.00"))
+        self.assertEqual(finance.annualized_spend_inr, Decimal("8000.00"))
+        self.assertIn("ENG-100", format_showback_csv(result))
+        renewal = result.renewals[0]
+        self.assertEqual(renewal.notice_deadline, date(2026, 11, 15))
+        self.assertEqual(renewal.days_until_notice_deadline, 42)
+        self.assertEqual(renewal.status, "action_due_soon")
+        self.assertIn("notice_deadline", format_renewals_csv(result))
 
     def test_contract_floor_caps_savings_and_renewal_prorates(self) -> None:
         self.basic_inputs()
@@ -146,6 +174,8 @@ class SaaSSentryTests(unittest.TestCase):
         data = load_inputs(self.hr, self.usage, self.billing)
         result = analyze(data, as_of=date(2026, 10, 4))
         self.assertEqual(result.findings, ())
+        self.assertEqual(result.showback[0].cost_center, "Unassigned")
+        self.assertEqual(result.showback[0].active_license_count, 2)
         self.assertEqual(sum(issue.issue == "identity_conflict" for issue in result.issues), 1)
         self.assertEqual(sum(issue.issue == "unmatched_identity" for issue in result.issues), 1)
         self.assertIn("identity_conflict", format_quality_csv(result))
@@ -207,6 +237,9 @@ class SaaSSentryTests(unittest.TestCase):
         result = analyze(load_inputs(self.hr, self.usage, self.billing, currency=currency),
                          as_of=date(2026, 10, 4), currency=currency)
         payload = report_payload(result, as_of=date(2026, 10, 4), source_paths=[self.hr, self.usage, self.billing])
+        self.assertTrue(payload["cost_center_showback"])
+        self.assertTrue(payload["renewal_calendar"])
+        self.assertIn("Renewal calendar", render_html(payload))
         snapshots = self.root / "snapshots"
         write_snapshot(snapshots, payload)
         write_snapshot(snapshots, payload)

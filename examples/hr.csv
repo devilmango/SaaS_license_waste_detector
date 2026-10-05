@@ -1,5 +1,5 @@
-employee,employee_id,email,email_aliases,status
-Alice,E001,alice@company.com,,active
-Bob,E002,bob@company.com,robert@company.com,active
-John,E003,john@company.com,,terminated
-Cara,E004,cara@company.com,,active
+employee,employee_id,email,email_aliases,department,cost_center,status
+Alice,E001,alice@company.com,,Engineering,ENG-100,active
+Bob,E002,bob@company.com,robert@company.com,Engineering,ENG-100,active
+John,E003,john@company.com,,People,PEO-200,terminated
+Cara,E004,cara@company.com,,Product,PRD-300,active

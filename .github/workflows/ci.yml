@@ -43,7 +43,16 @@ jobs:
           --quality-csv data-quality.csv
           --output-json report.json
           --output-html report.html
+          --showback-csv showback.csv
+          --renewals-csv renewals.csv
           --snapshot-dir snapshots
+
+      - name: Import FOCUS billing example
+        run: >-
+          saas-sentry focus import
+          --input examples/focus-billing.csv
+          --output focus-spend.csv
+          --config config.example.toml
 
       - name: Run scheduled report once
         run: >-

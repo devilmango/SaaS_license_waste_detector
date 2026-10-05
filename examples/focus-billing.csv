@@ -1,0 +1,4 @@
+ProviderName,ServiceName,BilledCost,BillingCurrency,BillingPeriodStart,BillingPeriodEnd,Tags
+Vendor A,Slack,24000,INR,2026-09-01T00:00:00Z,2026-10-01T00:00:00Z,"{""cost_center"":""ENG-100""}"
+Vendor A,Slack,8000,INR,2026-09-01T00:00:00Z,2026-10-01T00:00:00Z,"{""cost_center"":""PRD-300""}"
+Vendor B,Notion,12000,INR,2026-09-01T00:00:00Z,2026-10-01T00:00:00Z,"{""cost_center"":""PRD-300""}"

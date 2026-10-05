@@ -23,9 +23,12 @@ from .engine import (
     load_config,
     load_inputs,
     load_reviews,
+    format_renewals_csv,
+    format_showback_csv,
     update_review,
 )
 from .reports import compare_snapshots, list_snapshots, read_snapshot, render_html, report_payload, write_snapshot
+from .focus import format_focus_spend, load_focus_spend
 
 
 def _money(value: str) -> Decimal:
@@ -86,6 +89,8 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument("--quality-csv", type=Path, help="write unmatched/conflicting/contract issues to this CSV")
     report.add_argument("--output-json", type=Path, help="write a machine-readable report JSON")
     report.add_argument("--output-html", type=Path, help="write a standalone HTML report")
+    report.add_argument("--showback-csv", type=Path, help="write annual license spend and opportunity by cost center")
+    report.add_argument("--renewals-csv", type=Path, help="write contract renewal and notice planning calendar")
     report.add_argument("--snapshot-dir", type=Path, help="save an analysis snapshot in this directory")
     report.add_argument("--review-file", type=Path, help="include decisions from a review ledger CSV")
 
@@ -106,6 +111,14 @@ def build_parser() -> argparse.ArgumentParser:
     microsoft = connectors.add_parser("microsoft365", help="import M365 users, SKUs, and sign-in dates")
     microsoft.add_argument("--pricing", type=Path, required=True, help="CSV mapping sku_part_number to annual_cost and contract terms")
     microsoft.add_argument("--output-dir", type=Path, required=True, help="directory for canonical usage.csv and billing.csv")
+
+    focus = subparsers.add_parser("focus", help="normalize FOCUS billing exports")
+    focus_actions = focus.add_subparsers(dest="focus_command", required=True)
+    focus_import = focus_actions.add_parser("import", help="aggregate a FOCUS CSV into cost-center spend")
+    focus_import.add_argument("--input", type=Path, required=True, help="FOCUS cost and usage CSV")
+    focus_import.add_argument("--output", type=Path, required=True, help="normalized spend CSV destination")
+    focus_import.add_argument("--config", type=Path, help="currency conversion rates and effective date")
+    focus_import.add_argument("--cost-center-tag", default="cost_center", help="FOCUS Tags key for cost center")
 
     history = subparsers.add_parser("history", help="list or compare saved analysis snapshots")
     history_actions = history.add_subparsers(dest="history_command", required=True)
@@ -156,7 +169,10 @@ def _analyze(args: argparse.Namespace) -> int:
     reviews = load_reviews(args.review_file)
     print(format_report(result, reviews))
     inputs = {path.resolve() for path in (args.hr, args.usage, args.billing, args.contract_pricing, args.config) if path}
-    output_paths = [path for path in (args.output_csv, args.quality_csv, args.output_json, args.output_html) if path]
+    output_paths = [path for path in (
+        args.output_csv, args.quality_csv, args.output_json, args.output_html,
+        args.showback_csv, args.renewals_csv,
+    ) if path]
     resolved_outputs = [path.resolve() for path in output_paths]
     if len(set(resolved_outputs)) != len(resolved_outputs):
         raise InputError("report output paths must be different")
@@ -179,6 +195,10 @@ def _analyze(args: argparse.Namespace) -> int:
         _write_text(args.output_json, json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
     if args.output_html:
         _write_text(args.output_html, render_html(payload))
+    if args.showback_csv:
+        _write_text(args.showback_csv, format_showback_csv(result))
+    if args.renewals_csv:
+        _write_text(args.renewals_csv, format_renewals_csv(result))
     if args.snapshot_dir:
         print(f"Saved analysis snapshot to {write_snapshot(args.snapshot_dir, payload)}")
     return 0
@@ -210,6 +230,18 @@ def _connect(args: argparse.Namespace) -> int:
         print("The connector is read-only; use the supplied HR CSV and run analyze on the generated exports.")
         return 0
     return 2
+
+
+def _focus_import(args: argparse.Namespace) -> int:
+    if args.output.resolve() == args.input.resolve():
+        raise InputError("FOCUS import output cannot overwrite its input")
+    if args.config and args.output.resolve() == args.config.resolve():
+        raise InputError("FOCUS import output cannot overwrite its configuration")
+    _, currency = load_config(args.config)
+    rows = load_focus_spend(args.input, currency=currency, cost_center_tag=args.cost_center_tag)
+    _write_text(args.output, format_focus_spend(rows, currency.rate_date))
+    print(f"Normalized {len(rows)} FOCUS spend groups into {args.output}.")
+    return 0
 
 
 def _history(args: argparse.Namespace) -> int:
@@ -260,6 +292,8 @@ def _watch(args: argparse.Namespace) -> int:
         args.quality_csv = args.output_dir / f"quality-{stamp}.csv"
         args.output_json = args.output_dir / f"report-{stamp}.json"
         args.output_html = args.output_dir / f"report-{stamp}.html"
+        args.showback_csv = args.output_dir / f"showback-{stamp}.csv"
+        args.renewals_csv = args.output_dir / f"renewals-{stamp}.csv"
         args.snapshot_dir = args.output_dir / "snapshots"
         args.as_of = None
         _analyze(args)
@@ -279,6 +313,8 @@ def main() -> int:
             return _review(args)
         if args.command == "connect":
             return _connect(args)
+        if args.command == "focus":
+            return _focus_import(args)
         if args.command == "history":
             return _history(args)
         return _watch(args)

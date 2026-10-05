@@ -22,6 +22,8 @@ class Person:
     status: str
     employee_id: str
     aliases: tuple[str, ...]
+    department: str
+    cost_center: str
 
 
 @dataclass(frozen=True)
@@ -109,6 +111,8 @@ class Finding:
     employee: str
     email: str
     employee_id: str
+    department: str
+    cost_center: str
     application: str
     contract_id: str
     category: str
@@ -130,6 +134,34 @@ class Analysis:
     active_license_count: int
     issues: tuple[DataIssue, ...]
     currency_rate_date: date | None
+    showback: tuple["ShowbackRow", ...] = ()
+    renewals: tuple["RenewalRow", ...] = ()
+
+
+@dataclass(frozen=True)
+class ShowbackRow:
+    department: str
+    cost_center: str
+    active_license_count: int
+    annualized_spend_inr: Decimal
+    annual_opportunity_inr: Decimal
+    estimated_realizable_12m_inr: Decimal
+
+
+@dataclass(frozen=True)
+class RenewalRow:
+    contract_id: str
+    applications: str
+    renewal_date: date | None
+    commitment_end_date: date | None
+    notice_deadline: date | None
+    change_effective_date: date | None
+    days_until_notice_deadline: int | None
+    active_seats: int
+    annualized_spend_inr: Decimal
+    candidate_count: int
+    annual_opportunity_inr: Decimal
+    status: str
 
 
 def normalize_email(email: str) -> str:
@@ -246,8 +278,11 @@ def load_inputs(
         if key in people:
             issues.append(DataIssue("hr", line, email or employee_id, "duplicate_person_key", f"Identity key {key!r} is duplicated."))
             key = f"{key}:row:{line}"
-        person = Person(key, row.get("employee", "") or email or employee_id, email,
-                        status, employee_id, aliases)
+        person = Person(
+            key, row.get("employee", "") or email or employee_id, email,
+            status, employee_id, aliases,
+            row.get("department", "").strip(), row.get("cost_center", "").strip(),
+        )
         people[key] = person
         for address in sorted({normalized_email, *aliases}):
             if address:
@@ -480,6 +515,7 @@ def analyze(
         ).hexdigest()[:16]
         finding = Finding(
             finding_id, person.employee, person.email or license.email, person.employee_id,
+            person.department, person.cost_center,
             license.application, license.contract_id, category, reason,
             license.annual_cost_inr, renewal_date=license.renewal_date,
             commitment_end_date=license.commitment_end_date, notice_days=license.notice_days,
@@ -589,8 +625,76 @@ def analyze(
                    "savings_effective_date": effective}
             ))
     updated.sort(key=lambda item: (item.application.casefold(), item.category, item.email.casefold()))
+
+    findings_by_id = {finding.finding_id: finding for finding in updated}
+    showback_totals: dict[tuple[str, str], list[Decimal | int]] = {}
+    for license in active_licenses:
+        person = data.people.get(license.person_key or "")
+        department = person.department if person and person.department else "Unassigned"
+        cost_center = person.cost_center if person and person.cost_center else "Unassigned"
+        key = (department, cost_center)
+        totals = showback_totals.setdefault(key, [0, Decimal("0"), Decimal("0"), Decimal("0")])
+        totals[0] = int(totals[0]) + 1
+        totals[1] = Decimal(totals[1]) + license.annual_cost_inr
+        finding_id = hashlib.sha256(
+            f"{person.key}\0{license.application.casefold()}".encode("utf-8")
+        ).hexdigest()[:16] if person else ""
+        finding = findings_by_id.get(finding_id)
+        if finding:
+            totals[2] = Decimal(totals[2]) + finding.opportunity_savings_inr
+            totals[3] = Decimal(totals[3]) + finding.realizable_12m_inr
+    showback = tuple(
+        ShowbackRow(department, cost_center, int(values[0]), Decimal(values[1]),
+                    Decimal(values[2]), Decimal(values[3]))
+        for (department, cost_center), values in sorted(
+            showback_totals.items(), key=lambda item: (item[0][0].casefold(), item[0][1].casefold())
+        )
+    )
+
+    findings_by_contract: dict[str, list[Finding]] = {}
+    for finding in updated:
+        findings_by_contract.setdefault(finding.contract_id.casefold(), []).append(finding)
+    renewals: list[RenewalRow] = []
+    for contract_key, contract_licenses in by_contract.items():
+        first = contract_licenses[0]
+        candidates_for_contract = findings_by_contract.get(contract_key, [])
+        effective = max(
+            (day for day in (first.renewal_date, first.commitment_end_date) if day),
+            default=today,
+        )
+        missed_notice = bool(
+            first.notice_days and (first.renewal_date or first.commitment_end_date)
+            and today > effective - timedelta(days=first.notice_days)
+        )
+        if missed_notice:
+            effective += timedelta(days=365)
+        effective = max(today, effective)
+        notice_deadline = effective - timedelta(days=first.notice_days) if first.renewal_date or first.commitment_end_date else None
+        days_to_deadline = (notice_deadline - today).days if notice_deadline else None
+        if notice_deadline is None:
+            renewal_status = "date_unknown"
+        elif missed_notice:
+            renewal_status = "missed_notice_next_cycle"
+        elif days_to_deadline is not None and days_to_deadline < 0:
+            renewal_status = "notice_overdue"
+        elif days_to_deadline is not None and days_to_deadline <= 90:
+            renewal_status = "action_due_soon"
+        else:
+            renewal_status = "scheduled"
+        renewals.append(RenewalRow(
+            first.contract_id,
+            "; ".join(sorted({license.application for license in contract_licenses}, key=str.casefold)),
+            first.renewal_date, first.commitment_end_date, notice_deadline,
+            effective if first.renewal_date or first.commitment_end_date else None,
+            days_to_deadline, len(contract_licenses),
+            sum((license.annual_cost_inr for license in contract_licenses), Decimal("0")),
+            len(candidates_for_contract),
+            sum((finding.opportunity_savings_inr for finding in candidates_for_contract), Decimal("0")),
+            renewal_status,
+        ))
+    renewals.sort(key=lambda row: (row.notice_deadline or date.max, row.contract_id.casefold()))
     active_count = len(active_licenses)
-    return Analysis(tuple(updated), active_count, tuple(issues), currency.rate_date)
+    return Analysis(tuple(updated), active_count, tuple(issues), currency.rate_date, showback, tuple(renewals))
 
 
 def format_report(analysis: Analysis, reviews: dict[str, dict[str, str]] | None = None) -> str:
@@ -649,7 +753,8 @@ def format_findings_csv(
     output = StringIO()
     writer = csv.writer(output)
     writer.writerow([
-        "finding_id", "employee", "employee_id", "email", "application", "contract_id",
+        "finding_id", "employee", "employee_id", "email", "department", "cost_center",
+        "application", "contract_id",
         "category", "reason", "evidence", "annualized_candidate_cost_inr",
         "contract_adjusted_annual_opportunity_inr", "estimated_realizable_12m_inr",
         "renewal_date", "commitment_end_date", "notice_days", "bundle_group",
@@ -660,6 +765,7 @@ def format_findings_csv(
         review = reviews.get(finding.finding_id, {})
         writer.writerow([
             finding.finding_id, finding.employee, finding.employee_id, finding.email,
+            finding.department or "Unassigned", finding.cost_center or "Unassigned",
             finding.application, finding.contract_id, finding.category, finding.reason,
             finding.evidence, f"{finding.annualized_cost_inr:.2f}",
             f"{finding.opportunity_savings_inr:.2f}", f"{finding.realizable_12m_inr:.2f}",
@@ -670,6 +776,51 @@ def format_findings_csv(
             analysis.currency_rate_date.isoformat() if analysis.currency_rate_date else "",
             review.get("status", "unreviewed"), review.get("owner", ""),
             review.get("note", ""), review.get("reviewed_on", ""),
+        ])
+    return output.getvalue()
+
+
+def format_showback_csv(analysis: Analysis) -> str:
+    """Serialize annualized license spend and savings by department and cost center."""
+    from io import StringIO
+
+    output = StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "department", "cost_center", "active_license_count", "annualized_spend_inr",
+        "annual_opportunity_inr", "estimated_realizable_12m_inr",
+    ])
+    for row in analysis.showback:
+        writer.writerow([
+            row.department, row.cost_center, row.active_license_count,
+            f"{row.annualized_spend_inr:.2f}", f"{row.annual_opportunity_inr:.2f}",
+            f"{row.estimated_realizable_12m_inr:.2f}",
+        ])
+    return output.getvalue()
+
+
+def format_renewals_csv(analysis: Analysis) -> str:
+    """Serialize contract renewal and notice milestones for procurement planning."""
+    from io import StringIO
+
+    output = StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "contract_id", "applications", "renewal_date", "commitment_end_date",
+        "notice_deadline", "change_effective_date", "days_until_notice_deadline",
+        "active_seats", "annualized_spend_inr", "candidate_count",
+        "annual_opportunity_inr", "status",
+    ])
+    for row in analysis.renewals:
+        writer.writerow([
+            row.contract_id, row.applications,
+            row.renewal_date.isoformat() if row.renewal_date else "",
+            row.commitment_end_date.isoformat() if row.commitment_end_date else "",
+            row.notice_deadline.isoformat() if row.notice_deadline else "",
+            row.change_effective_date.isoformat() if row.change_effective_date else "",
+            row.days_until_notice_deadline if row.days_until_notice_deadline is not None else "",
+            row.active_seats, f"{row.annualized_spend_inr:.2f}", row.candidate_count,
+            f"{row.annual_opportunity_inr:.2f}", row.status,
         ])
     return output.getvalue()
 

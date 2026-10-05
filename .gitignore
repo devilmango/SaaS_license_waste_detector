@@ -11,5 +11,8 @@ reports/
 imports/
 findings.csv
 data-quality.csv
+showback.csv
+renewals.csv
+focus-spend.csv
 report.json
 report.html

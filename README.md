@@ -14,6 +14,9 @@ SaaS Sentry combines HR, usage, and billing data to flag terminated accounts, st
 - Keep review decisions in a local CSV ledger.
 - Save analysis snapshots and compare findings across runs.
 - Generate CSV, JSON, and standalone HTML reports.
+- Allocate active license spend and modeled savings to departments and cost centers.
+- Build a contract renewal calendar with notice deadlines and upcoming actions.
+- Normalize FinOps Open Cost and Usage Specification (FOCUS) invoice data by service and cost-center tag.
 - Import Microsoft 365 directory users, assigned SKUs, and successful sign-in dates through read-only Graph access.
 - Run recurring reports in a foreground scheduler.
 
@@ -24,6 +27,7 @@ HR CSV ─────────────────┐
 Usage CSV or M365 import ┼─> Validate + resolve identity ─> Rules + contract model
 Billing CSV + price map ┘                                  ├─> Findings / quality CSV
                                                            ├─> JSON / HTML report
+                                                           ├─> Cost-center showback + renewal calendar
                                                            ├─> Analysis snapshots
                                                            └─> Review ledger
 ```
@@ -57,6 +61,8 @@ saas-sentry analyze \
   --quality-csv data-quality.csv \
   --output-json report.json \
   --output-html report.html \
+  --showback-csv showback.csv \
+  --renewals-csv renewals.csv \
   --snapshot-dir snapshots
 ```
 
@@ -68,13 +74,13 @@ CSV column names are case-sensitive. Extra columns are accepted. Files may be UT
 
 ### HR roster (`--hr`)
 
-Required headers: `employee,status`. Each row needs at least one of `email` or `employee_id`. Status is `active` or `terminated`. Optional `email_aliases` contains semicolon-separated addresses.
+Required headers: `employee,status`. Each row needs at least one of `email` or `employee_id`. Status is `active` or `terminated`. Optional `email_aliases` contains semicolon-separated addresses. Optional `department` and `cost_center` assign license spend and savings to an organizational owner; blank values appear as `Unassigned`.
 
 ```csv
-employee,employee_id,email,email_aliases,status
-Alice,E001,alice@company.com,,active
-Bob,E002,bob@company.com,robert@company.com,active
-John,E003,john@company.com,,terminated
+employee,employee_id,email,email_aliases,department,cost_center,status
+Alice,E001,alice@company.com,,Engineering,ENG-100,active
+Bob,E002,bob@company.com,robert@company.com,Engineering,ENG-100,active
+John,E003,john@company.com,,People,PEO-200,terminated
 ```
 
 ### SaaS usage (`--usage`)
@@ -229,6 +235,28 @@ saas-sentry watch --hr hr.csv --usage usage.csv --billing billing.csv \
 
 The scheduler expects input exports to be refreshed separately and can run under a process supervisor or host scheduler.
 
+### Cost-center showback
+
+`--showback-csv` writes one row per department and cost center with active seat count, annualized license spend, contract-adjusted annual opportunity, and estimated savings realizable in 12 months. The JSON and HTML reports include the same showback table. Spend is assigned from each active license to the employee's HR cost center; missing mappings are grouped under `Unassigned`. This is modeled assigned-license spend and should be reconciled to provider invoices.
+
+### Renewal calendar
+
+`--renewals-csv` writes one row per active contract with applications, renewal and commitment dates, the notice deadline, effective change date, current annualized spend, candidate count, and contract-adjusted opportunity. Status values are `scheduled`, `action_due_soon` (within 90 days), `missed_notice_next_cycle`, or `date_unknown`. The CSV is also embedded in JSON and HTML reports. If a notice date has passed, the planning estimate assumes the next annual cycle; this simplifying assumption is called out because vendor terms vary.
+
+### FOCUS invoice spend
+
+FOCUS exports represent billed charges and do not necessarily identify individual license holders. Import them as a complementary cost-center/service spend view rather than treating invoice rows as per-seat assignments. The importer uses standard FOCUS fields `ServiceName`, `BilledCost`, `BillingCurrency`, `BillingPeriodStart`, `BillingPeriodEnd`, and optional `ProviderName` and `Tags`. It reads the configured cost-center key from the JSON `Tags` column (default: `cost_center`), converts billed amounts to INR using the configured dated rates, then aggregates duplicates by provider, service, cost center, billing period, and source currency.
+
+```bash
+saas-sentry focus import \
+  --input focus-billing.csv \
+  --output focus-spend.csv \
+  --config config.toml \
+  --cost-center-tag cost_center
+```
+
+The output includes actual billed cost in INR, original billing currency, billing period, and exchange-rate date. It preserves negative adjustments/credits and groups charges with different currencies separately. See the [FOCUS specification](https://focus.finops.org/) for the interoperable cost and usage format.
+
 ## Data quality and privacy
 
 `--quality-csv` includes source, row, identity, issue, and remediation detail for unmatched/conflicting records, contract seat floors, and bundles. Conflicting identities are excluded; a unique employee ID or matching email may still resolve with a warning when the other identifier is unknown.
@@ -243,7 +271,10 @@ python -m unittest discover -s tests -v
 saas-sentry analyze --hr examples/hr.csv --usage examples/usage.csv \
   --billing examples/billing.csv --contract-pricing examples/contract-pricing.csv \
   --config config.example.toml --as-of 2026-10-04 \
-  --output-csv findings.csv --quality-csv data-quality.csv
+  --output-csv findings.csv --quality-csv data-quality.csv \
+  --showback-csv showback.csv --renewals-csv renewals.csv
+saas-sentry focus import --input examples/focus-billing.csv \
+  --output focus-spend.csv --config config.example.toml
 ```
 
 GitHub Actions runs package install, compilation, unit tests, and an example analysis on Python 3.11, 3.12, and 3.13.
