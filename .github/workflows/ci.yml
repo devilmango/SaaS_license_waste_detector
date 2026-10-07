@@ -71,6 +71,9 @@ jobs:
             --config config.example.toml --price-increase-percent 8 \
             --seat-growth-percent 12 --seat-reduction-percent 10 \
             --output renewal-forecast.csv
+          saas-sentry monitor \
+            --current report.json --baseline report.json \
+            --reconciliation reconciliation.csv --output anomalies.csv
 
       - name: Validate provider and action CLI help
         run: |
@@ -79,6 +82,9 @@ jobs:
           saas-sentry connect github-copilot --help
           saas-sentry connect zoom --help
           saas-sentry actions --help
+          saas-sentry actions execute --help
+          saas-sentry actions resolve-execution --help
+          saas-sentry monitor --help
 
       - name: Run scheduled report once
         run: >-

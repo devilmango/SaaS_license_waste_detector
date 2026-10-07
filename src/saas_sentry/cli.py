@@ -37,6 +37,8 @@ from .engine import (
 )
 from .reports import compare_snapshots, list_snapshots, read_snapshot, render_html, report_payload, write_snapshot
 from .focus import format_focus_spend, load_focus_spend
+from .execution import build_execution_plan, ensure_plan_available, execute_plan, resolve_execution
+from .monitoring import detect_anomalies, format_anomalies
 from .portfolio import (
     discover_portfolio,
     format_discovery,
@@ -211,7 +213,27 @@ def build_parser() -> argparse.ArgumentParser:
     action_reclaimed.add_argument("--actual-annual-savings", type=_money, required=True)
     action_reclaimed.add_argument("--note", default="")
     action_reclaimed.add_argument("--on", dest="occurred_on", type=date.fromisoformat)
-
+    action_execute = action_commands.add_parser(
+        "execute", help="preview or explicitly execute an approved Microsoft 365 license reclaim",
+    )
+    action_execute.add_argument("--findings", type=Path, required=True)
+    action_execute.add_argument("--billing", type=Path, required=True, help="latest provider billing export")
+    action_execute.add_argument("--file", type=Path, default=Path("actions.csv"), help="approval action ledger")
+    action_execute.add_argument("--execution-ledger", type=Path, default=Path("execution-events.csv"))
+    action_execute.add_argument("--action-id", required=True)
+    action_execute.add_argument("--provider", choices=("microsoft365",), default="microsoft365")
+    action_execute.add_argument("--executed-by", required=True)
+    action_execute.add_argument("--execute", action="store_true", help="perform the provider change; default is preview only")
+    action_resolve = action_commands.add_parser(
+        "resolve-execution", help="record an independent human reconciliation of an ambiguous provider result",
+    )
+    action_resolve.add_argument("--file", type=Path, default=Path("actions.csv"))
+    action_resolve.add_argument("--execution-ledger", type=Path, default=Path("execution-events.csv"))
+    action_resolve.add_argument("--action-id", required=True)
+    action_resolve.add_argument("--provider", choices=("microsoft365",), default="microsoft365")
+    action_resolve.add_argument("--resolved-as", choices=("completed", "not-applied"), required=True)
+    action_resolve.add_argument("--resolved-by", required=True)
+    action_resolve.add_argument("--note", required=True)
     history = subparsers.add_parser("history", help="list or compare saved analysis snapshots")
     history_actions = history.add_subparsers(dest="history_command", required=True)
     history_list = history_actions.add_parser("list", help="list snapshots in a directory")
@@ -221,6 +243,15 @@ def build_parser() -> argparse.ArgumentParser:
     history_compare.add_argument("--baseline", required=True, help="snapshot filename, run prefix, or latest")
     history_compare.add_argument("--current", required=True, help="snapshot filename, run prefix, or latest")
     history_compare.add_argument("--output-json", type=Path, help="optional path for comparison JSON")
+
+    monitor = subparsers.add_parser("monitor", help="detect spend, seat, renewal, contract, and invoice anomalies")
+    monitor.add_argument("--current", type=Path, required=True, help="current analysis JSON report or snapshot")
+    monitor.add_argument("--baseline", type=Path, help="optional prior analysis report or snapshot")
+    monitor.add_argument("--reconciliation", type=Path, help="optional reconciliation CSV from the reconcile command")
+    monitor.add_argument("--spend-change-threshold-percent", type=_money, default=Decimal("20"))
+    monitor.add_argument("--seat-change-threshold", type=_nonnegative, default=2)
+    monitor.add_argument("--renewal-window-days", type=_nonnegative, default=60)
+    monitor.add_argument("--output", type=Path, required=True)
 
     watch = subparsers.add_parser("watch", help="run recurring reports in the foreground")
     watch.add_argument("--hr", type=Path, required=True)
@@ -367,6 +398,38 @@ def _actions(args: argparse.Namespace) -> int:
         )
         print(f"Proposed reclaim action {action_id}; approval is required before completion.")
         return 0
+    if args.action_command == "execute":
+        inputs = (args.findings, args.billing, args.file, args.execution_ledger)
+        if args.execution_ledger.resolve() in {path.resolve() for path in inputs[:-1]}:
+            raise ActionError("execution ledger cannot overwrite an action or input file")
+        plan = build_execution_plan(
+            args.file, args.findings, args.billing, args.action_id, provider=args.provider,
+        )
+        ensure_plan_available(plan, args.execution_ledger)
+        print(
+            f"Action {plan.action_id}: {plan.provider} would remove application {plan.application!r} "
+            f"from {plan.email}. Idempotency key: {plan.idempotency_key}."
+        )
+        if not args.execute:
+            print("Preview only; no provider request was sent. Pass --execute to perform the approved change.")
+            return 0
+        connector = Microsoft365Connector.from_environment()
+        result = execute_plan(
+            plan, args.execution_ledger, actor=args.executed_by,
+            operation=lambda target: connector.remove_user_license(
+                target.provider_user_id, target.provider_license_id,
+            ),
+        )
+        print(f"Provider execution recorded as {result} in {args.execution_ledger}.")
+        print("Verify refreshed billing data before recording actual savings with actions reclaimed.")
+        return 0
+    if args.action_command == "resolve-execution":
+        resolve_execution(
+            args.file, args.execution_ledger, args.action_id, provider=args.provider,
+            resolved_as=args.resolved_as.replace("-", "_"), actor=args.resolved_by, note=args.note,
+        )
+        print(f"Recorded independent {args.resolved_as} reconciliation for action {args.action_id}.")
+        return 0
     event = {"approve": "approved", "reject": "rejected", "reclaimed": "reclaimed"}[args.action_command]
     transition_action(
         args.file, args.action_id, event, actor=args.actor, note=args.note,
@@ -475,6 +538,31 @@ def _history(args: argparse.Namespace) -> int:
     return 0
 
 
+def _monitor(args: argparse.Namespace) -> int:
+    current = read_snapshot(args.current)
+    baseline = read_snapshot(args.baseline) if args.baseline else None
+    anomalies = detect_anomalies(
+        current, baseline=baseline, reconciliation_path=args.reconciliation,
+        spend_change_threshold_percent=args.spend_change_threshold_percent,
+        seat_change_threshold=args.seat_change_threshold,
+        renewal_window_days=args.renewal_window_days,
+    )
+    inputs = {args.current.resolve()}
+    if args.baseline:
+        inputs.add(args.baseline.resolve())
+    if args.reconciliation:
+        inputs.add(args.reconciliation.resolve())
+    if args.output.resolve() in inputs:
+        raise InputError("monitor output cannot overwrite an input file")
+    _write_text(args.output, format_anomalies(anomalies))
+    counts = {severity: sum(row.severity == severity for row in anomalies) for severity in ("high", "medium", "low")}
+    print(
+        f"Detected {len(anomalies)} anomalies ({counts['high']} high, {counts['medium']} medium, "
+        f"{counts['low']} low) in {args.output}."
+    )
+    return 0
+
+
 def _watch(args: argparse.Namespace) -> int:
     if not math.isfinite(args.every_hours) or args.every_hours <= 0:
         raise InputError("--every-hours must be greater than zero")
@@ -518,6 +606,8 @@ def main() -> int:
             return _actions(args)
         if args.command == "history":
             return _history(args)
+        if args.command == "monitor":
+            return _monitor(args)
         return _watch(args)
     except (InputError, ConnectorError, ActionError, OSError, ValueError) as exc:
         print(f"saas-sentry: error: {exc}", file=sys.stderr)

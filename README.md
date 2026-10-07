@@ -2,7 +2,7 @@
 
 **A local CLI for detecting unused SaaS licenses, reviewing recommendations, and estimating contract-aware savings.**
 
-SaaS Sentry combines HR, usage, and billing data to flag terminated accounts, stale logins, and expensive low-use licenses. It produces transparent findings, data-quality diagnostics, historical comparisons, cost-center showback, and reports. CSV analysis stays local; provider connectors import data without changing provider state. Reclaim actions require separate approval and are recorded locally.
+SaaS Sentry combines HR, usage, and billing data to flag terminated accounts, stale logins, and expensive low-use licenses. It produces transparent findings, data-quality diagnostics, historical comparisons, cost-center showback, anomaly alerts, and reports. CSV analysis stays local; provider imports are read-only. Microsoft 365 reclaim execution is a separate, explicitly enabled workflow requiring an approved action.
 
 ## Features
 
@@ -20,6 +20,8 @@ SaaS Sentry combines HR, usage, and billing data to flag terminated accounts, st
 - Reconcile FOCUS invoice spend to assigned-license costs, flagging variances and unlicensed spend.
 - Discover unmanaged SaaS applications and overlapping apps from a combined procurement/SSO/expense inventory.
 - Forecast renewal costs with seat-growth, reduction, contract-floor, and vendor price-increase scenarios.
+- Monitor report snapshots for material spend/seat shifts, renewal deadlines, seat-floor exposure, and invoice anomalies.
+- Execute approved Microsoft 365 direct-license reclaims with preview-by-default, fresh state checks, and an idempotent audit ledger.
 - Import Microsoft 365 directory users, assigned SKUs, and successful sign-in dates through read-only Graph access.
 - Import Google Workspace, Slack, GitHub Copilot, and Zoom license/activity data through provider APIs.
 - Run recurring reports in a foreground scheduler.
@@ -200,7 +202,7 @@ Statuses are `confirmed`, `dismissed`, and `deferred`. Add `--review-file review
 
 `connect microsoft365` reads directory users, assigned license SKUs, and last successful sign-in through Microsoft Graph, then writes canonical `usage.csv` and `billing.csv`. Sign-in is a user-level signal repeated for each assigned SKU, not per-workload activity. Negotiated prices and contract terms are supplied in a local price map because Graph does not provide those values.
 
-Register an Entra application with admin consent for application permissions `User.Read.All`, `LicenseAssignment.Read.All`, and `AuditLog.Read.All`. Microsoft documents that `signInActivity` requires `AuditLog.Read.All` and an Entra ID P1/P2 license; the user list is limited to a maximum page size of 500 when selecting sign-in activity. See [list users](https://learn.microsoft.com/en-us/graph/api/user-list?view=graph-rest-1.0), [sign-in activity](https://learn.microsoft.com/en-us/graph/api/resources/signinactivity?view=graph-rest-1.0), [list subscribed SKUs](https://learn.microsoft.com/en-us/graph/api/subscribedsku-list?view=graph-rest-1.0), and [client credentials](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-client-creds-grant-flow).
+For import, register an Entra application with admin consent for application permissions `User.Read.All`, `LicenseAssignment.Read.All`, and `AuditLog.Read.All`. Microsoft documents that `signInActivity` requires `AuditLog.Read.All` and an Entra ID P1/P2 license; the user list is limited to a maximum page size of 500 when selecting sign-in activity. See [list users](https://learn.microsoft.com/en-us/graph/api/user-list?view=graph-rest-1.0), [sign-in activity](https://learn.microsoft.com/en-us/graph/api/resources/signinactivity?view=graph-rest-1.0), [list subscribed SKUs](https://learn.microsoft.com/en-us/graph/api/subscribedsku-list?view=graph-rest-1.0), and [client credentials](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-client-creds-grant-flow).
 
 Put credentials in environment variables or a secret manager, never in repository files:
 
@@ -369,7 +371,7 @@ The CSV includes current spend, projected seats and spend before reductions, and
 
 ## Approval-based reclaim tracking
 
-The action ledger is an append-only local CSV event log. A proposal requires a finding with `review_status=confirmed`. A different person must approve the proposed reclaim before it can be marked reclaimed. Completion records actual annual savings so the variance from the estimate can be reviewed. Rejections are recorded too. The workflow does not revoke provider licenses; all connectors remain import-only.
+The action ledger is an append-only local CSV event log. A proposal requires a finding with `review_status=confirmed`. A different person must approve the proposed reclaim before it can be marked reclaimed. Completion records actual annual savings so the variance from the estimate can be reviewed. Rejections are recorded too. Provider execution is a separate opt-in command with its own execution ledger.
 
 ```bash
 # Confirm the candidate in the review ledger, then export reviewed findings.
@@ -390,11 +392,50 @@ saas-sentry actions list --file actions.csv
 
 The action list reports status, owner, proposer, approver, estimated savings, actual savings, and variance. Keep the ledger access-controlled because it contains employee references and approver identities.
 
+### Monitoring anomalies and contract limits
+
+Compare a current JSON analysis report with a baseline to flag material spend or seat-count changes by cost center and contract. The monitor also flags contracts below their committed seat floor, reclaim candidates blocked by contract minimums, approaching notice deadlines, and any non-matching status in a reconciliation CSV.
+
+```bash
+saas-sentry monitor --current report.json --baseline previous-report.json \
+  --reconciliation reconciliation.csv --spend-change-threshold-percent 20 \
+  --seat-change-threshold 2 --renewal-window-days 60 --output anomalies.csv
+```
+
+Baseline comparison is optional. `--current` and `--baseline` accept JSON report files or saved snapshots. The output is an alert CSV; findings are signals for review and do not trigger provider changes.
+
+### Guarded Microsoft 365 reclaim execution
+
+Microsoft 365 imports now preserve the user and SKU IDs needed to resolve a provider action. The action must already be approved by someone other than its proposer, and its finding must still be confirmed. `actions execute` is preview-only unless `--execute` is explicitly supplied. Execution re-reads the user's assignment, refuses group-assigned or unverifiable licenses, and logs a durable idempotency key and provider result. If a request has an ambiguous outcome, a different operator must reconcile the tenant state before marking it completed or enabling a retry:
+
+```bash
+# Preview first: no credentials or provider request are needed for this step.
+saas-sentry actions execute --findings findings.csv --billing imports/m365/billing.csv \
+  --file actions.csv --execution-ledger execution-events.csv \
+  --action-id <ACTION_ID> --provider microsoft365 --executed-by operator@example.com
+
+# Only after reviewing the preview, explicitly perform the provider change.
+saas-sentry actions execute --findings findings.csv --billing imports/m365/billing.csv \
+  --file actions.csv --execution-ledger execution-events.csv \
+  --action-id <ACTION_ID> --provider microsoft365 --executed-by operator@example.com --execute
+```
+
+Execution requires Microsoft Graph application permission `LicenseAssignment.ReadWrite.All` in addition to the import permissions, with admin consent. The adapter uses Graph's [`assignLicense` endpoint](https://learn.microsoft.com/en-us/graph/api/user-assignlicense?view=graph-rest-1.0) and checks [`licenseAssignmentStates`](https://learn.microsoft.com/en-us/graph/api/resources/licenseassignmentstate?view=graph-rest-1.0) to distinguish direct from group-assigned licenses. This permission can change tenant licensing; keep its credentials in a secret manager and grant it only to an execution app. After execution, refresh provider data and verify the actual change before recording realized savings with `actions reclaimed`. The current execution adapter supports direct Microsoft 365 SKU assignments only; group-based assignments are deliberately refused.
+
+```bash
+saas-sentry actions resolve-execution --file actions.csv \
+  --execution-ledger execution-events.csv --action-id <ACTION_ID> \
+  --provider microsoft365 --resolved-as not-applied \
+  --resolved-by reviewer@example.com --note "Refreshed tenant state confirms the SKU remains assigned"
+```
+
+Use `--resolved-as completed` when the tenant confirms the license was removed; then refresh exports and record actual savings. `not-applied` permits another attempt with the same action idempotency key. A reconciliation must be recorded by someone other than the last execution actor.
+
 ## Data quality and privacy
 
 `--quality-csv` includes source, row, identity, issue, and remediation detail for unmatched/conflicting records, contract seat floors, and bundles. Conflicting identities are excluded; a unique employee ID or matching email may still resolve with a warning when the other identifier is unknown.
 
-Local CSV analysis makes no network calls. Provider connectors require network access and do not mutate provider data. Google Workspace's license scope includes write permission even though this connector makes GET requests only. Review ledgers, action logs, snapshots, and reports may contain employee information; store them with appropriate access controls.
+Local CSV analysis and execution previews make no network calls. Provider imports are read-only; explicitly executed Microsoft 365 reclaim actions make a narrowly scoped licensing change after approval and fresh assignment validation. Google Workspace's license scope includes write permission even though its connector makes GET requests only. Review ledgers, execution logs, snapshots, and reports may contain employee information; store them with appropriate access controls.
 
 ## CI and development
 

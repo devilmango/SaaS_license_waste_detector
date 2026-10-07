@@ -158,6 +158,7 @@ class RenewalRow:
     change_effective_date: date | None
     days_until_notice_deadline: int | None
     active_seats: int
+    seat_minimum: int
     annualized_spend_inr: Decimal
     candidate_count: int
     annual_opportunity_inr: Decimal
@@ -687,6 +688,7 @@ def analyze(
             first.renewal_date, first.commitment_end_date, notice_deadline,
             effective if first.renewal_date or first.commitment_end_date else None,
             days_to_deadline, len(contract_licenses),
+            max((license.seat_minimum for license in contract_licenses), default=0),
             sum((license.annual_cost_inr for license in contract_licenses), Decimal("0")),
             len(candidates_for_contract),
             sum((finding.opportunity_savings_inr for finding in candidates_for_contract), Decimal("0")),
@@ -808,7 +810,7 @@ def format_renewals_csv(analysis: Analysis) -> str:
     writer.writerow([
         "contract_id", "applications", "renewal_date", "commitment_end_date",
         "notice_deadline", "change_effective_date", "days_until_notice_deadline",
-        "active_seats", "annualized_spend_inr", "candidate_count",
+        "active_seats", "seat_minimum", "annualized_spend_inr", "candidate_count",
         "annual_opportunity_inr", "status",
     ])
     for row in analysis.renewals:
@@ -819,7 +821,7 @@ def format_renewals_csv(analysis: Analysis) -> str:
             row.notice_deadline.isoformat() if row.notice_deadline else "",
             row.change_effective_date.isoformat() if row.change_effective_date else "",
             row.days_until_notice_deadline if row.days_until_notice_deadline is not None else "",
-            row.active_seats, f"{row.annualized_spend_inr:.2f}", row.candidate_count,
+            row.active_seats, row.seat_minimum, f"{row.annualized_spend_inr:.2f}", row.candidate_count,
             f"{row.annual_opportunity_inr:.2f}", row.status,
         ])
     return output.getvalue()

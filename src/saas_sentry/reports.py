@@ -114,12 +114,12 @@ def render_html(payload: dict[str, Any]) -> str:
         "<tr>" + "".join(f"<td>{html.escape(str(value or ''))}</td>" for value in (
             row["contract_id"], row["applications"], row.get("renewal_date"),
             row.get("commitment_end_date"), row.get("notice_deadline"),
-            row.get("days_until_notice_deadline"), row["active_seats"],
+            row.get("days_until_notice_deadline"), row["active_seats"], row.get("seat_minimum", 0),
             f"₹{Decimal(row['annualized_spend_inr']):,.2f}",
             f"₹{Decimal(row['annual_opportunity_inr']):,.2f}", row["status"],
         )) + "</tr>"
         for row in payload.get("renewal_calendar", [])
-    ) or '<tr><td colspan="10">No active contracts to display.</td></tr>'
+    ) or '<tr><td colspan="11">No active contracts to display.</td></tr>'
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>SaaS Sentry report</title><style>
@@ -138,7 +138,7 @@ th{{background:#f2f5f8}}tr:nth-child(even){{background:#fafbfd}}code{{overflow-w
 <p>Active licenses analyzed: {int(payload['active_license_count'])}. Findings are recommendations for review; estimated savings are not guaranteed.</p>
 <h2>Cost-center showback</h2><table><thead><tr><th>Department</th><th>Cost center</th><th>Active licenses</th><th>Annualized spend</th><th>Annual opportunity</th><th>Estimated 12-month savings</th></tr></thead>
 <tbody>{showback_rows}</tbody></table>
-<h2>Renewal calendar</h2><table><thead><tr><th>Contract</th><th>Applications</th><th>Renewal</th><th>Commitment end</th><th>Notice deadline</th><th>Days to deadline</th><th>Seats</th><th>Annual spend</th><th>Opportunity</th><th>Status</th></tr></thead>
+<h2>Renewal calendar</h2><table><thead><tr><th>Contract</th><th>Applications</th><th>Renewal</th><th>Commitment end</th><th>Notice deadline</th><th>Days to deadline</th><th>Seats</th><th>Seat minimum</th><th>Annual spend</th><th>Opportunity</th><th>Status</th></tr></thead>
 <tbody>{renewal_rows}</tbody></table>
 <h2>Findings</h2><table><thead><tr><th>Application</th><th>Employee</th><th>Email</th><th>Category</th><th>Reason</th><th>Evidence</th><th>Annual opportunity</th><th>Estimated 12-month savings</th><th>Review</th></tr></thead>
 <tbody>{''.join(rows)}</tbody></table>

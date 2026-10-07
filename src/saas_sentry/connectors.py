@@ -1,4 +1,4 @@
-"""Read-only provider data imports."""
+"""Provider data imports and guarded remediation APIs."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import uuid
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, quote, urlencode, urlparse
 from urllib.request import Request, urlopen
@@ -195,6 +196,44 @@ class Microsoft365Connector:
             raise ConnectorError("Microsoft identity response did not include an access token")
         return token
 
+    def remove_user_license(self, user_id: str, sku_id: str) -> str:
+        """Remove one directly assigned M365 SKU after revalidating the imported target."""
+        try:
+            user_id = str(uuid.UUID(user_id))
+            sku_id = str(uuid.UUID(sku_id))
+        except ValueError as exc:
+            raise ConnectorError("Microsoft 365 reclaim target IDs must be UUIDs") from exc
+        token = self._token()
+        encoded_user = quote(user_id, safe="")
+        query = urlencode({"$select": "id,assignedLicenses,licenseAssignmentStates"})
+        user_url = f"{GRAPH_ROOT}/users/{encoded_user}?{query}"
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        user = self._json_request(Request(user_url, headers=headers))
+        if str(user.get("id", "")).casefold() != user_id.casefold():
+            raise ConnectorError("Microsoft 365 returned a different user than the requested reclaim target")
+        assigned = user.get("assignedLicenses")
+        if not isinstance(assigned, list):
+            raise ConnectorError("Microsoft 365 user response omitted assignedLicenses; refusing the reclaim")
+        if not any(str(item.get("skuId", "")).casefold() == sku_id.casefold()
+                   for item in assigned if isinstance(item, dict)):
+            return "license_already_absent"
+        states = user.get("licenseAssignmentStates")
+        if not isinstance(states, list):
+            raise ConnectorError("Microsoft 365 response omitted licenseAssignmentStates; refusing the reclaim")
+        target_states = [item for item in states if isinstance(item, dict)
+                         and str(item.get("skuId", "")).casefold() == sku_id.casefold()]
+        if not target_states:
+            raise ConnectorError("Microsoft 365 could not verify the target license assignment state")
+        if any(item.get("assignedByGroup") for item in target_states):
+            raise ConnectorError("The target license is group-assigned; remove it through the group workflow")
+        if not any(str(item.get("state", "")).casefold() == "active" for item in target_states):
+            raise ConnectorError("The target license assignment is not active; refusing the reclaim")
+        url = f"{GRAPH_ROOT}/users/{encoded_user}/assignLicense"
+        body = json.dumps({"addLicenses": [], "removeLicenses": [sku_id]}).encode("utf-8")
+        request = Request(url, data=body, headers={**headers, "Content-Type": "application/json"}, method="POST")
+        self._json_request(request)
+        return "license_removed"
+
     def _get_pages(self, url: str, token: str) -> list[dict]:
         output: list[dict] = []
         next_url: str | None = url
@@ -274,13 +313,16 @@ class Microsoft365Connector:
                 if not price:
                     missing_prices.add(sku_part)
                     continue
+                if not user.get("id"):
+                    raise ConnectorError("Microsoft Graph user is missing its stable id; refusing an incomplete import")
                 usage_rows.append([employee, employee_id, principal, sku_part, last_login, "", "", "", ""])
                 billing_rows.append([
                     employee_id, principal, sku_part, "active", price.get("annual_cost", ""),
                     price.get("currency", ""), price.get("contract_id", "") or sku_part,
                     price.get("renewal_date", ""), price.get("seat_minimum", "0") or "0",
                     price.get("commitment_end_date", ""), price.get("notice_days", "0") or "0",
-                    price.get("bundle_group", ""),
+                    price.get("bundle_group", ""), "microsoft365", str(user.get("id", "")),
+                    str(assignment.get("skuId", "")),
                 ])
         if missing_prices:
             raise ConnectorError(
@@ -295,7 +337,7 @@ class Microsoft365Connector:
         billing_headers = [
             "employee_id", "email", "application", "license_status", "annual_cost", "currency",
             "contract_id", "renewal_date", "seat_minimum", "commitment_end_date", "notice_days",
-            "bundle_group",
+            "bundle_group", "provider", "provider_user_id", "provider_license_id",
         ]
         _atomic_csv(output_dir / "usage.csv", usage_headers, usage_rows)
         _atomic_csv(output_dir / "billing.csv", billing_headers, billing_rows)
