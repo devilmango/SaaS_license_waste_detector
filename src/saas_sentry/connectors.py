@@ -55,6 +55,26 @@ def _bearer_bytes(url: str, token: str, provider: str, allowed_hosts: set[str]) 
         raise ConnectorError(f"{provider} API request failed: {type(exc).__name__}") from exc
 
 
+def _bearer_mutation(
+    url: str, token: str, provider: str, allowed_hosts: set[str], *, method: str,
+    body: bytes | None = None, headers: dict[str, str] | None = None,
+) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.hostname not in allowed_hosts:
+        raise ConnectorError(f"{provider}: refused unexpected API URL")
+    request_headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    request_headers.update(headers or {})
+    if body is not None:
+        request_headers.setdefault("Content-Type", "application/json")
+    try:
+        with urlopen(Request(url, data=body, headers=request_headers, method=method), timeout=30):
+            pass
+    except HTTPError as exc:
+        raise ConnectorError(f"{provider} API returned HTTP {exc.code}") from exc
+    except (URLError, TimeoutError, OSError) as exc:
+        raise ConnectorError(f"{provider} API request failed: {type(exc).__name__}") from exc
+
+
 def _required_token(name: str, provider: str) -> str:
     token = os.environ.get(name, "")
     if not token:
@@ -103,11 +123,12 @@ def _write_provider_exports(
         "employee", "employee_id", "email", "application", "last_login", "usage_count",
         "active_days", "usage_window_days", "features_used",
     ], usage_rows)
+    normalized_billing = [row + [provider, "", ""] if len(row) == 12 else row for row in billing_rows]
     _atomic_csv(output_dir / "billing.csv", [
         "employee_id", "email", "application", "license_status", "annual_cost", "currency",
         "contract_id", "renewal_date", "seat_minimum", "commitment_end_date", "notice_days",
-        "bundle_group",
-    ], billing_rows)
+        "bundle_group", "provider", "provider_user_id", "provider_license_id",
+    ], normalized_billing)
     metadata = {
         "provider": provider, "imported_at": datetime.now(timezone.utc).isoformat(),
         "user_count": len({(row[2] or row[1]).casefold() for row in usage_rows}),
@@ -437,7 +458,9 @@ class GoogleWorkspaceConnector:
                 if pair in usage_by_pair:
                     raise ConnectorError("Pricing maps multiple assigned Google SKUs to the same application/user")
                 usage_by_pair[pair] = [full_name, "", email, application, last_login, "", "", "", ""]
-                billing_rows.append(_billing_export_row(identity, price, application))
+                billing_rows.append(_billing_export_row(identity, price, application) + [
+                    "google_workspace", email, json.dumps([price["product_id"], price["sku_id"]]),
+                ])
         if missing_skus:
             raise ConnectorError(
                 "Add pricing mappings for Google Workspace product/SKUs: "
@@ -447,6 +470,24 @@ class GoogleWorkspaceConnector:
             "google_workspace", output_dir, list(usage_by_pair.values()), billing_rows,
             "Google Directory lastLoginTime per user, repeated for each assigned SKU",
         )
+
+    def remove_user_license(self, user_id: str, sku_id: str) -> str:
+        """Revoke one Google Workspace product/SKU assignment for an exact user email."""
+        try:
+            product_id, sku = json.loads(sku_id)
+        except (ValueError, TypeError) as exc:
+            raise ConnectorError("Google Workspace reclaim target must contain a product and SKU") from exc
+        if not all(isinstance(value, str) and value.strip() for value in (product_id, sku, user_id)):
+            raise ConnectorError("Google Workspace reclaim target is incomplete")
+        path = "/".join(quote(value, safe="") for value in (product_id, "sku", sku, "user", user_id))
+        url = f"https://licensing.googleapis.com/apps/licensing/v1/product/{path}"
+        current = _bearer_json(url, self.access_token, "Google Workspace", self.HOSTS)
+        if (str(current.get("userId", "")).casefold() != user_id.casefold()
+                or str(current.get("productId", "")).casefold() != product_id.casefold()
+                or str(current.get("skuId", "")).casefold() != sku.casefold()):
+            raise ConnectorError("Google Workspace returned a different license target; refusing the reclaim")
+        _bearer_mutation(url, self.access_token, "Google Workspace", self.HOSTS, method="DELETE")
+        return "license_revoked"
 
 
 class SlackConnector:
@@ -676,7 +717,9 @@ class GitHubCopilotConnector:
             }
             usage_rows.append([employee, identity["employee_id"], identity["email"], application,
                                last_activity, "", "", "", ""])
-            billing_rows.append(_billing_export_row(identity, price, application))
+            billing_rows.append(_billing_export_row(identity, price, application) + [
+                "github_copilot", login, organization,
+            ])
         if missing_logins:
             raise ConnectorError(
                 "Add identity mappings for assigned Copilot users: " + ", ".join(sorted(missing_logins))
@@ -685,6 +728,42 @@ class GitHubCopilotConnector:
             "github_copilot", output_dir, usage_rows, billing_rows,
             "GitHub Copilot last_activity_at; IDE telemetry must be enabled for IDE activity to appear",
         )
+
+    def remove_user_license(self, user_id: str, sku_id: str) -> str:
+        """Request cancellation of one organization's Copilot seat for a username."""
+        organization, username = sku_id, user_id
+        if not organization.strip() or not username.strip() or "/" in organization:
+            raise ConnectorError("GitHub Copilot reclaim target must include organization and username")
+        token = self.access_token
+        seats: list[dict] = []
+        for page in range(1, 10001):
+            query = urlencode({"per_page": "100", "page": str(page)})
+            current = _bearer_json(
+                f"https://api.github.com/orgs/{quote(organization, safe='')}/copilot/billing/seats?{query}",
+                token, "GitHub Copilot", self.HOSTS,
+                headers={"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"},
+            )
+            values = current.get("seats")
+            if not isinstance(values, list):
+                raise ConnectorError("GitHub Copilot response is missing its seats array")
+            seats.extend(item for item in values if isinstance(item, dict))
+            if len(values) < 100:
+                break
+        else:
+            raise ConnectorError("GitHub Copilot reclaim pagination exceeded the safety limit")
+        matches = [seat for seat in seats if str((seat.get("assignee") or {}).get("login", "")).casefold()
+                   == username.casefold()]
+        if not matches:
+            return "seat_already_absent"
+        if len(matches) != 1:
+            raise ConnectorError("GitHub Copilot username resolved to multiple seats; refusing cancellation")
+        url = f"https://api.github.com/orgs/{quote(organization, safe='')}/copilot/billing/selected_users"
+        payload = json.dumps({"selected_usernames": [username]}).encode("utf-8")
+        _bearer_mutation(
+            url, self.access_token, "GitHub Copilot", self.HOSTS, method="DELETE", body=payload,
+            headers={"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"},
+        )
+        return "seat_cancellation_requested"
 
 
 class ZoomConnector:

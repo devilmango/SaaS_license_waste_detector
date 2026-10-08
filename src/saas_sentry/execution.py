@@ -6,7 +6,6 @@ import csv
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
-import uuid
 from pathlib import Path
 from typing import Callable
 
@@ -51,13 +50,6 @@ def _identity(value: str) -> str:
     return " ".join(value.casefold().split())
 
 
-def _uuid(value: str, field: str) -> str:
-    try:
-        return str(uuid.UUID(value))
-    except (ValueError, AttributeError) as exc:
-        raise ActionError(f"Provider target {field} must be a UUID; re-import the provider data") from exc
-
-
 def _idempotency_key(action_id: str, provider: str) -> str:
     raw_key = "\0".join((action_id, provider, "remove-license"))
     return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
@@ -71,9 +63,9 @@ def build_execution_plan(
     *,
     provider: str = "microsoft365",
 ) -> ExecutionPlan:
-    """Resolve an approved action to exactly one imported M365 user/SKU target."""
-    if provider != "microsoft365":
-        raise ActionError("Only the microsoft365 reclaim adapter is currently supported")
+    """Resolve an approved action to exactly one imported provider user/license target."""
+    if provider not in {"microsoft365", "google_workspace", "github_copilot"}:
+        raise ActionError(f"Unsupported reclaim provider {provider!r}")
     action = next((item for item in list_actions(action_ledger) if item.action_id == action_id), None)
     if not action:
         raise ActionError(f"Unknown action_id {action_id!r}")
@@ -103,8 +95,10 @@ def build_execution_plan(
             f"Finding resolved to {len(matches)} active {provider} license targets; exactly one is required"
         )
     target = matches[0]
-    user_id = _uuid(target.get("provider_user_id", ""), "provider_user_id")
-    license_id = _uuid(target.get("provider_license_id", ""), "provider_license_id")
+    user_id = target.get("provider_user_id", "").strip()
+    license_id = target.get("provider_license_id", "").strip()
+    if not user_id or not license_id:
+        raise ActionError(f"Provider target is incomplete; re-import {provider} data")
     return ExecutionPlan(
         action.action_id, action.finding_id, provider, email, application, user_id, license_id,
         _idempotency_key(action.action_id, provider),
@@ -230,8 +224,8 @@ def resolve_execution(
     note: str,
 ) -> None:
     """Record an independent human reconciliation of an ambiguous provider result."""
-    if provider != "microsoft365":
-        raise ActionError("Only the microsoft365 reclaim adapter is currently supported")
+    if provider not in {"microsoft365", "google_workspace", "github_copilot"}:
+        raise ActionError(f"Unsupported reclaim provider {provider!r}")
     if resolved_as not in {"completed", "not_applied"}:
         raise ActionError("resolved_as must be completed or not_applied")
     if not actor.strip() or not note.strip():

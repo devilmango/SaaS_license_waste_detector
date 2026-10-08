@@ -59,6 +59,12 @@ class ProviderConnectorTests(unittest.TestCase):
         self.assertEqual(result, (1, 1))
         self.assertTrue(all(call.args[0].startswith("https://") for call in mocked.call_args_list))
         self.assertEqual(self.read_csv(output / "usage.csv")[0]["last_login"], "2026-10-01")
+        google_license = self.read_csv(output / "billing.csv")[0]
+        self.assertEqual(google_license["provider"], "google_workspace")
+        self.assertEqual(google_license["provider_user_id"], "person@example.com")
+        self.assertEqual(json.loads(google_license["provider_license_id"]), [
+            "Google-Apps", "Google-Apps-For-Business",
+        ])
         self.assertTrue(json.loads((output / "import.json").read_text())["read_only"])
 
     def test_slack_import_uses_daily_member_analytics_without_presence_guessing(self) -> None:
@@ -102,6 +108,43 @@ class ProviderConnectorTests(unittest.TestCase):
         self.assertEqual(mocked.call_count, 1)
         self.assertEqual(self.read_csv(output / "usage.csv")[0]["email"], "octo@example.com")
         self.assertEqual(self.read_csv(output / "usage.csv")[0]["last_login"], "2026-09-30")
+        github_license = self.read_csv(output / "billing.csv")[0]
+        self.assertEqual(github_license["provider"], "github_copilot")
+        self.assertEqual(github_license["provider_user_id"], "octocat")
+        self.assertEqual(github_license["provider_license_id"], "example-org")
+
+    def test_google_workspace_reclaim_verifies_target_before_delete(self) -> None:
+        connector = GoogleWorkspaceConnector("token")
+        url = "https://licensing.googleapis.com/apps/licensing/v1/product/Google-Apps/sku/Business/user/person%40example.com"
+        with patch("saas_sentry.connectors._bearer_json", return_value={
+            "productId": "Google-Apps", "skuId": "Business", "userId": "person@example.com",
+        }) as verify, patch("saas_sentry.connectors._bearer_mutation") as delete:
+            result = connector.remove_user_license("person@example.com", '["Google-Apps", "Business"]')
+        self.assertEqual(result, "license_revoked")
+        verify.assert_called_once_with(url, "token", "Google Workspace", connector.HOSTS)
+        delete.assert_called_once_with(url, "token", "Google Workspace", connector.HOSTS, method="DELETE")
+
+    def test_github_copilot_reclaim_targets_only_selected_username(self) -> None:
+        connector = GitHubCopilotConnector("token")
+        with patch("saas_sentry.connectors._bearer_json", return_value={"seats": [
+            {"assignee": {"login": "octocat"}},
+        ]}) as verify, patch("saas_sentry.connectors._bearer_mutation") as mutation:
+            result = connector.remove_user_license("octocat", "example-org")
+        self.assertEqual(result, "seat_cancellation_requested")
+        self.assertIn("/copilot/billing/seats?", verify.call_args.args[0])
+        request = mutation.call_args.args[0]
+        self.assertIn("/orgs/example-org/copilot/billing/selected_users", request)
+        self.assertEqual(mutation.call_args.kwargs["method"], "DELETE")
+        self.assertEqual(json.loads(mutation.call_args.kwargs["body"]), {"selected_usernames": ["octocat"]})
+
+    def test_github_copilot_does_not_cancel_missing_seat(self) -> None:
+        connector = GitHubCopilotConnector("token")
+        with patch("saas_sentry.connectors._bearer_json", return_value={"seats": []}) as verify, \
+                patch("saas_sentry.connectors._bearer_mutation") as mutation:
+            result = connector.remove_user_license("octocat", "example-org")
+        self.assertEqual(result, "seat_already_absent")
+        verify.assert_called_once()
+        mutation.assert_not_called()
 
     def test_zoom_imports_licensed_users_only(self) -> None:
         pricing = self.write_csv(self.root / "zoom-pricing.csv", ["user_type", "application", "annual_cost"], [

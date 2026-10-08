@@ -2,7 +2,7 @@
 
 **A local CLI for detecting unused SaaS licenses, reviewing recommendations, and estimating contract-aware savings.**
 
-SaaS Sentry combines HR, usage, and billing data to flag terminated accounts, stale logins, and expensive low-use licenses. It produces transparent findings, data-quality diagnostics, historical comparisons, cost-center showback, anomaly alerts, and reports. CSV analysis stays local; provider imports are read-only. Microsoft 365 reclaim execution is a separate, explicitly enabled workflow requiring an approved action.
+SaaS Sentry combines HR, usage, contract, and billing data to flag terminated accounts, stale logins, expensive low-use licenses, and contract entitlement exposure. It produces transparent findings, data-quality diagnostics, historical comparisons, cost-center showback, anomaly alerts, and reports. Provider imports are read-only. License reclaim execution is a separate, explicitly enabled workflow requiring an approved action.
 
 ## Features
 
@@ -21,7 +21,9 @@ SaaS Sentry combines HR, usage, and billing data to flag terminated accounts, st
 - Discover unmanaged SaaS applications and overlapping apps from a combined procurement/SSO/expense inventory.
 - Forecast renewal costs with seat-growth, reduction, contract-floor, and vendor price-increase scenarios.
 - Monitor report snapshots for material spend/seat shifts, renewal deadlines, seat-floor exposure, and invoice anomalies.
-- Execute approved Microsoft 365 direct-license reclaims with preview-by-default, fresh state checks, and an idempotent audit ledger.
+- Execute approved Microsoft 365 and Google Workspace license reclaims and GitHub Copilot seat cancellations with preview-by-default and an idempotent audit ledger.
+- Compare assigned licenses with purchased contract entitlements to identify seat overages, unused seats, and missing entitlement records.
+- Deliver monitor alerts to an HTTPS JSON webhook with preview-by-default and a local deduplication ledger.
 - Import Microsoft 365 directory users, assigned SKUs, and successful sign-in dates through read-only Graph access.
 - Import Google Workspace, Slack, GitHub Copilot, and Zoom license/activity data through provider APIs.
 - Run recurring reports in a foreground scheduler.
@@ -404,9 +406,9 @@ saas-sentry monitor --current report.json --baseline previous-report.json \
 
 Baseline comparison is optional. `--current` and `--baseline` accept JSON report files or saved snapshots. The output is an alert CSV; findings are signals for review and do not trigger provider changes.
 
-### Guarded Microsoft 365 reclaim execution
+### Guarded provider reclaim execution
 
-Microsoft 365 imports now preserve the user and SKU IDs needed to resolve a provider action. The action must already be approved by someone other than its proposer, and its finding must still be confirmed. `actions execute` is preview-only unless `--execute` is explicitly supplied. Execution re-reads the user's assignment, refuses group-assigned or unverifiable licenses, and logs a durable idempotency key and provider result. If a request has an ambiguous outcome, a different operator must reconcile the tenant state before marking it completed or enabling a retry:
+Provider imports preserve target identifiers needed to resolve a provider action. The action must already be approved by someone other than its proposer, and its finding must still be confirmed. `actions execute` is preview-only unless `--execute` is explicitly supplied. Execution uses an idempotency ledger; if a request has an ambiguous outcome, a different operator must reconcile provider state before marking it completed or enabling a retry:
 
 ```bash
 # Preview first: no credentials or provider request are needed for this step.
@@ -420,7 +422,7 @@ saas-sentry actions execute --findings findings.csv --billing imports/m365/billi
   --action-id <ACTION_ID> --provider microsoft365 --executed-by operator@example.com --execute
 ```
 
-Execution requires Microsoft Graph application permission `LicenseAssignment.ReadWrite.All` in addition to the import permissions, with admin consent. The adapter uses Graph's [`assignLicense` endpoint](https://learn.microsoft.com/en-us/graph/api/user-assignlicense?view=graph-rest-1.0) and checks [`licenseAssignmentStates`](https://learn.microsoft.com/en-us/graph/api/resources/licenseassignmentstate?view=graph-rest-1.0) to distinguish direct from group-assigned licenses. This permission can change tenant licensing; keep its credentials in a secret manager and grant it only to an execution app. After execution, refresh provider data and verify the actual change before recording realized savings with `actions reclaimed`. The current execution adapter supports direct Microsoft 365 SKU assignments only; group-based assignments are deliberately refused.
+Microsoft 365 execution requires Graph application permission `LicenseAssignment.ReadWrite.All` with admin consent. It re-reads the assignment, checks `licenseAssignmentStates`, and refuses group-assigned or unverifiable licenses. Google Workspace execution uses the [License Manager delete endpoint](https://developers.google.com/workspace/admin/licensing/reference/rest/v1/licenseAssignments/delete) to verify and revoke the exact product/SKU assignment; its credential needs the appropriate licensing write scope. GitHub Copilot execution calls the [selected-users cancellation endpoint](https://docs.github.com/en/rest/copilot/copilot-user-management) for one organization username; GitHub marks the seat for cancellation at the end of the current billing cycle, and team-assigned seats may be refused by the API. Grant execution credentials only to a narrowly scoped execution app and keep them in a secret manager. Refresh provider exports and verify the resulting billing state before recording realized savings.
 
 ```bash
 saas-sentry actions resolve-execution --file actions.csv \
@@ -431,11 +433,39 @@ saas-sentry actions resolve-execution --file actions.csv \
 
 Use `--resolved-as completed` when the tenant confirms the license was removed; then refresh exports and record actual savings. `not-applied` permits another attempt with the same action idempotency key. A reconciliation must be recorded by someone other than the last execution actor.
 
+Supported providers are selected with `--provider microsoft365`, `--provider google_workspace`, or `--provider github_copilot`. Previewing does not require provider credentials. Provider mutations require `--execute`.
+
+### Contract entitlement and overage tracking
+
+Keep purchased seat counts in a contract CSV with `contract_id,application,entitled_seats`. The command compares that entitlement with active assignments in the billing export. Overages are priced using the mean annual cost per active assignment for the contract/application pair; missing entitlement mappings are surfaced as `missing_entitlement` rather than omitted.
+
+```bash
+saas-sentry entitlements --billing examples/billing.csv \
+  --contracts examples/contract-entitlements.csv --output entitlements.csv
+```
+
+The report includes active and entitled seats, overage seats, unused entitlement seats, and estimated annual overage exposure. It is a reconciliation signal: reconcile contract line items and billing terms with procurement before changing a subscription.
+
+### Webhook alert delivery
+
+Generate an anomaly CSV with `monitor`, then preview the newly eligible alerts before delivery. The generic HTTPS webhook receives one JSON object containing `source` and an `alerts` array. Successful deliveries are recorded in the local ledger and duplicate alert rows are skipped on subsequent runs. A changed alert (for example, changed current value or summary) has a different key and can be delivered again.
+
+```bash
+saas-sentry notify --alerts anomalies.csv --ledger alert-deliveries.csv \
+  --webhook-url https://hooks.example.com/saas-sentry
+# After reviewing the preview, explicitly deliver:
+SAAS_SENTRY_WEBHOOK_TOKEN="<secret>" saas-sentry notify \
+  --alerts anomalies.csv --ledger alert-deliveries.csv \
+  --webhook-url https://hooks.example.com/saas-sentry --send
+```
+
+The URL must use HTTPS and cannot embed credentials. The optional bearer token is read from `SAAS_SENTRY_WEBHOOK_TOKEN`. A delivery is marked only after a successful 2xx response; keep the ledger durable to preserve deduplication across runs.
+
 ## Data quality and privacy
 
 `--quality-csv` includes source, row, identity, issue, and remediation detail for unmatched/conflicting records, contract seat floors, and bundles. Conflicting identities are excluded; a unique employee ID or matching email may still resolve with a warning when the other identifier is unknown.
 
-Local CSV analysis and execution previews make no network calls. Provider imports are read-only; explicitly executed Microsoft 365 reclaim actions make a narrowly scoped licensing change after approval and fresh assignment validation. Google Workspace's license scope includes write permission even though its connector makes GET requests only. Review ledgers, execution logs, snapshots, and reports may contain employee information; store them with appropriate access controls.
+Local CSV analysis, alert previews, and execution previews make no network calls. Provider imports are read-only; explicitly executed reclaim actions and webhook deliveries send network requests only after the corresponding opt-in flags. Review ledgers, execution logs, snapshots, reports, and webhook payloads may contain employee information; store them with appropriate access controls.
 
 ## CI and development
 

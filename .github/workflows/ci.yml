@@ -75,6 +75,13 @@ jobs:
             --current report.json --baseline report.json \
             --reconciliation reconciliation.csv --output anomalies.csv
 
+      - name: Validate contract entitlement report and alert delivery preview
+        run: |
+          saas-sentry entitlements --billing examples/billing.csv \
+            --contracts examples/contract-entitlements.csv --output entitlements.csv
+          saas-sentry notify --alerts anomalies.csv --ledger alert-deliveries.csv \
+            --webhook-url https://example.invalid/webhook
+
       - name: Validate provider and action CLI help
         run: |
           saas-sentry connect google-workspace --help
@@ -85,6 +92,8 @@ jobs:
           saas-sentry actions execute --help
           saas-sentry actions resolve-execution --help
           saas-sentry monitor --help
+          saas-sentry notify --help
+          saas-sentry entitlements --help
 
       - name: Run scheduled report once
         run: >-

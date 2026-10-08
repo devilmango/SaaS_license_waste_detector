@@ -146,6 +146,20 @@ class ProviderExecutionTests(unittest.TestCase):
         with self.assertRaisesRegex(ActionError, "exactly one is required"):
             build_execution_plan(self.actions, self.findings, self.billing, self.action_id)
 
+    def test_google_and_github_provider_targets_support_opaque_ids(self) -> None:
+        self.approve()
+        cases = [
+            ("google_workspace", "person@example.com", '["Google-Apps", "Business"]'),
+            ("github_copilot", "octocat", "example-org"),
+        ]
+        for provider, user_id, license_id in cases:
+            with self.subTest(provider=provider):
+                self.write_csv("billing.csv", [
+                    "email", "application", "license_status", "provider", "provider_user_id", "provider_license_id",
+                ], [["person@example.com", "SKU_ONE", "active", provider, user_id, license_id]])
+                plan = build_execution_plan(self.actions, self.findings, self.billing, self.action_id, provider=provider)
+                self.assertEqual((plan.provider_user_id, plan.provider_license_id), (user_id, license_id))
+
 
 if __name__ == "__main__":
     unittest.main()
