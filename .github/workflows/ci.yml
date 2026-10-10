@@ -81,6 +81,10 @@ jobs:
             --contracts examples/contract-entitlements.csv --output entitlements.csv
           saas-sentry notify --alerts anomalies.csv --ledger alert-deliveries.csv \
             --webhook-url https://example.invalid/webhook
+          saas-sentry import-health --hr examples/hr.csv --usage examples/usage.csv \
+            --billing examples/billing.csv --output import-health.csv
+          saas-sentry realization --actions actions.csv --findings findings.csv \
+            --output savings-realization.csv
 
       - name: Validate provider and action CLI help
         run: |
@@ -94,6 +98,8 @@ jobs:
           saas-sentry monitor --help
           saas-sentry notify --help
           saas-sentry entitlements --help
+          saas-sentry import-health --help
+          saas-sentry realization --help
 
       - name: Run scheduled report once
         run: >-

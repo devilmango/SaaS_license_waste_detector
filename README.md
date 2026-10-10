@@ -24,6 +24,8 @@ SaaS Sentry combines HR, usage, contract, and billing data to flag terminated ac
 - Execute approved Microsoft 365 and Google Workspace license reclaims and GitHub Copilot seat cancellations with preview-by-default and an idempotent audit ledger.
 - Compare assigned licenses with purchased contract entitlements to identify seat overages, unused seats, and missing entitlement records.
 - Deliver monitor alerts to an HTTPS JSON webhook with preview-by-default and a local deduplication ledger.
+- Report source freshness, identity-match coverage, import quality issues, and provider metadata consistency.
+- Compare realized annual savings with estimates and break results down by owner, app, department, cost center, and month.
 - Import Microsoft 365 directory users, assigned SKUs, and successful sign-in dates through read-only Graph access.
 - Import Google Workspace, Slack, GitHub Copilot, and Zoom license/activity data through provider APIs.
 - Run recurring reports in a foreground scheduler.
@@ -393,6 +395,33 @@ saas-sentry actions list --file actions.csv
 ```
 
 The action list reports status, owner, proposer, approver, estimated savings, actual savings, and variance. Keep the ledger access-controlled because it contains employee references and approver identities.
+
+### Savings realization report
+
+The action ledger records estimated and actual annual savings when a reclaim is completed. Generate a CSV report to compare those amounts, see the realization percentage and variance, track estimated savings still in the proposed/approved pipeline, and group results by owner, application, department, cost center, and completion month:
+
+```bash
+saas-sentry realization --actions actions.csv --findings findings.csv \
+  --output savings-realization.csv
+```
+
+Only reclaimed actions contribute to actual-versus-estimated realization. Pending actions appear separately as pipeline estimates; rejected actions remain visible in counts. Completion month uses the reclaimed event date recorded in the action ledger. Actual savings are user-entered annualized estimates and should be reconciled against post-change invoices or renewal charges.
+
+### Import health and identity coverage
+
+Check HR, usage, and billing source row counts, match coverage, quality issues, and freshness. With provider `import.json` metadata, the report also checks that the imported license-assignment count agrees with the billing CSV. The default stale threshold is seven days; override it for the cadence used by your exports.
+
+```bash
+saas-sentry import-health --hr examples/hr.csv --usage examples/usage.csv \
+  --billing examples/billing.csv --output import-health.csv
+
+# Provider export folders also contain import.json:
+saas-sentry import-health --hr examples/hr.csv --usage imports/slack/usage.csv \
+  --billing imports/slack/billing.csv --metadata imports/slack/import.json \
+  --stale-after-days 3 --output slack-import-health.csv
+```
+
+Freshness uses provider `imported_at` for usage/billing when metadata is supplied; otherwise it uses each CSV file's modification date. HR freshness always uses the HR CSV modification date. Identity coverage is the percentage of rows that resolve uniquely through primary email, aliases, or employee ID. The report surfaces missing/unmatched identities, collisions, malformed source values, and duplicate app/user rows as issues; it does not modify source files.
 
 ### Monitoring anomalies and contract limits
 

@@ -25,6 +25,8 @@ from .connectors import (
 )
 from .alerts import deliver_alerts
 from .entitlements import analyze_entitlements, format_entitlements
+from .import_health import build_import_health, format_import_health
+from .realization import build_realization_report, format_realization_report
 from .engine import (
     InputError,
     analyze,
@@ -274,6 +276,24 @@ def build_parser() -> argparse.ArgumentParser:
     entitlements.add_argument("--billing", type=Path, required=True)
     entitlements.add_argument("--contracts", type=Path, required=True, help="contract entitlements CSV")
     entitlements.add_argument("--output", type=Path, required=True)
+
+    import_health = subparsers.add_parser(
+        "import-health", help="report source freshness, identity coverage, and import metadata consistency",
+    )
+    import_health.add_argument("--hr", type=Path, required=True)
+    import_health.add_argument("--usage", type=Path, required=True)
+    import_health.add_argument("--billing", type=Path, required=True)
+    import_health.add_argument("--metadata", type=Path, help="optional provider import.json metadata")
+    import_health.add_argument("--stale-after-days", type=_nonnegative, default=7)
+    import_health.add_argument("--as-of", type=date.fromisoformat, help="report date (YYYY-MM-DD)")
+    import_health.add_argument("--output", type=Path, required=True)
+
+    realization = subparsers.add_parser(
+        "realization", help="compare modeled and actual annual savings from reclaim actions",
+    )
+    realization.add_argument("--actions", type=Path, required=True, help="append-only actions CSV ledger")
+    realization.add_argument("--findings", type=Path, required=True, help="findings CSV used to propose actions")
+    realization.add_argument("--output", type=Path, required=True)
 
     watch = subparsers.add_parser("watch", help="run recurring reports in the foreground")
     watch.add_argument("--hr", type=Path, required=True)
@@ -621,6 +641,43 @@ def _entitlements(args: argparse.Namespace) -> int:
     return 0
 
 
+def _import_health(args: argparse.Namespace) -> int:
+    inputs = {args.hr.resolve(), args.usage.resolve(), args.billing.resolve()}
+    if args.metadata:
+        inputs.add(args.metadata.resolve())
+    if args.output.resolve() in inputs:
+        raise InputError("import health output cannot overwrite an input file")
+    rows = build_import_health(
+        args.hr, args.usage, args.billing, metadata_path=args.metadata,
+        as_of=args.as_of, stale_after_days=args.stale_after_days,
+    )
+    _write_text(args.output, format_import_health(rows))
+    statuses = {status: sum(row.status == status for row in rows) for status in ("healthy", "issues", "stale", "empty", "future_dated")}
+    print(
+        f"Wrote import health for {len(rows)} sources "
+        f"({statuses['healthy']} healthy, {statuses['issues']} with issues, {statuses['stale']} stale)."
+    )
+    return 0
+
+
+def _realization(args: argparse.Namespace) -> int:
+    if args.output.resolve() in {args.actions.resolve(), args.findings.resolve()}:
+        raise InputError("savings realization output cannot overwrite an input file")
+    rows = build_realization_report(args.actions, args.findings)
+    _write_text(args.output, format_realization_report(rows))
+    overall = next((row for row in rows if row.scope_type == "overall"), None)
+    if not overall:
+        print(f"Wrote an empty savings realization report to {args.output}.")
+    else:
+        rate = f"{overall.realization_percent:.2f}%" if overall.realization_percent is not None else "n/a"
+        print(
+            f"Wrote savings realization: {overall.reclaimed_count} reclaimed actions, "
+            f"₹{overall.actual_annual_inr:.2f}/year actual vs ₹{overall.estimated_reclaimed_annual_inr:.2f}/year "
+            f"estimated ({rate} realization)."
+        )
+    return 0
+
+
 def _watch(args: argparse.Namespace) -> int:
     if not math.isfinite(args.every_hours) or args.every_hours <= 0:
         raise InputError("--every-hours must be greater than zero")
@@ -670,6 +727,10 @@ def main() -> int:
             return _notify(args)
         if args.command == "entitlements":
             return _entitlements(args)
+        if args.command == "import-health":
+            return _import_health(args)
+        if args.command == "realization":
+            return _realization(args)
         return _watch(args)
     except (InputError, ConnectorError, ActionError, OSError, ValueError) as exc:
         print(f"saas-sentry: error: {exc}", file=sys.stderr)
