@@ -27,6 +27,7 @@ from .alerts import deliver_alerts
 from .entitlements import analyze_entitlements, format_entitlements
 from .import_health import build_import_health, format_import_health
 from .realization import build_realization_report, format_realization_report
+from .verification import format_invoice_verification, verify_invoice_savings
 from .engine import (
     InputError,
     analyze,
@@ -219,7 +220,7 @@ def build_parser() -> argparse.ArgumentParser:
     action_reclaimed.add_argument("--note", default="")
     action_reclaimed.add_argument("--on", dest="occurred_on", type=date.fromisoformat)
     action_execute = action_commands.add_parser(
-        "execute", help="preview or explicitly execute an approved Microsoft 365 license reclaim",
+        "execute", help="preview or explicitly execute an approved provider license reclaim",
     )
     action_execute.add_argument("--findings", type=Path, required=True)
     action_execute.add_argument("--billing", type=Path, required=True, help="latest provider billing export")
@@ -227,7 +228,7 @@ def build_parser() -> argparse.ArgumentParser:
     action_execute.add_argument("--execution-ledger", type=Path, default=Path("execution-events.csv"))
     action_execute.add_argument("--action-id", required=True)
     action_execute.add_argument(
-        "--provider", choices=("microsoft365", "google_workspace", "github_copilot"),
+        "--provider", choices=("microsoft365", "google_workspace", "github_copilot", "slack", "zoom"),
         default="microsoft365",
     )
     action_execute.add_argument("--executed-by", required=True)
@@ -239,7 +240,7 @@ def build_parser() -> argparse.ArgumentParser:
     action_resolve.add_argument("--execution-ledger", type=Path, default=Path("execution-events.csv"))
     action_resolve.add_argument("--action-id", required=True)
     action_resolve.add_argument(
-        "--provider", choices=("microsoft365", "google_workspace", "github_copilot"),
+        "--provider", choices=("microsoft365", "google_workspace", "github_copilot", "slack", "zoom"),
         default="microsoft365",
     )
     action_resolve.add_argument("--resolved-as", choices=("completed", "not-applied"), required=True)
@@ -295,6 +296,16 @@ def build_parser() -> argparse.ArgumentParser:
     realization.add_argument("--findings", type=Path, required=True, help="findings CSV used to propose actions")
     realization.add_argument("--output", type=Path, required=True)
 
+    verify_savings = subparsers.add_parser(
+        "verify-savings", help="compare post-reclaim actual invoice spend with the prior period",
+    )
+    verify_savings.add_argument("--actions", type=Path, required=True)
+    verify_savings.add_argument("--findings", type=Path, required=True)
+    verify_savings.add_argument("--baseline-invoice", type=Path, required=True, help="normalized FOCUS CSV for prior period")
+    verify_savings.add_argument("--current-invoice", type=Path, required=True, help="normalized FOCUS CSV for later period")
+    verify_savings.add_argument("--minimum-realization-percent", type=_money, default=Decimal("80"))
+    verify_savings.add_argument("--output", type=Path, required=True)
+
     watch = subparsers.add_parser("watch", help="run recurring reports in the foreground")
     watch.add_argument("--hr", type=Path, required=True)
     watch.add_argument("--usage", type=Path, required=True)
@@ -311,6 +322,22 @@ def build_parser() -> argparse.ArgumentParser:
     watch.add_argument("--output-dir", type=Path, required=True)
     watch.add_argument("--every-hours", type=float, default=24.0)
     watch.add_argument("--once", action="store_true", help="write one scheduled report and exit")
+
+    sync = subparsers.add_parser("sync", help="import a provider on a schedule and analyze each refreshed export")
+    sync.add_argument("--provider", choices=("microsoft365", "google-workspace", "slack", "github-copilot", "zoom"), required=True)
+    sync.add_argument("--hr", type=Path, required=True)
+    sync.add_argument("--pricing", type=Path, required=True)
+    sync.add_argument("--output-dir", type=Path, required=True, help="provider exports and scheduled reports directory")
+    sync.add_argument("--contract-pricing", type=Path)
+    sync.add_argument("--config", type=Path)
+    sync.add_argument("--review-file", type=Path)
+    sync.add_argument("--organization", help="GitHub organization for github-copilot")
+    sync.add_argument("--identity-map", type=Path, help="GitHub login-to-HR map for github-copilot")
+    sync.add_argument("--customer", default="my_customer", help="Google Workspace customer ID")
+    sync.add_argument("--lookback-days", type=_nonnegative, default=90)
+    sync.add_argument("--team-id", default="", help="Slack workspace ID when using an organization token")
+    sync.add_argument("--every-hours", type=float, default=24.0)
+    sync.add_argument("--once", action="store_true", help="sync, analyze once, and exit")
     return parser
 
 
@@ -452,6 +479,8 @@ def _actions(args: argparse.Namespace) -> int:
             "microsoft365": "remove",
             "google_workspace": "revoke",
             "github_copilot": "request cancellation of",
+            "slack": "remove",
+            "zoom": "convert to Basic",
         }[plan.provider]
         print(
             f"Action {plan.action_id}: {plan.provider} would {operation_label} application {plan.application!r} "
@@ -464,6 +493,8 @@ def _actions(args: argparse.Namespace) -> int:
             "microsoft365": Microsoft365Connector.from_environment,
             "google_workspace": GoogleWorkspaceConnector.from_environment,
             "github_copilot": GitHubCopilotConnector.from_environment,
+            "slack": SlackConnector.from_environment,
+            "zoom": ZoomConnector.from_environment,
         }
         connector = connectors[plan.provider]()
         result = execute_plan(
@@ -678,6 +709,23 @@ def _realization(args: argparse.Namespace) -> int:
     return 0
 
 
+def _verify_savings(args: argparse.Namespace) -> int:
+    inputs = {
+        args.actions.resolve(), args.findings.resolve(),
+        args.baseline_invoice.resolve(), args.current_invoice.resolve(),
+    }
+    if args.output.resolve() in inputs:
+        raise InputError("invoice verification output cannot overwrite an input file")
+    rows = verify_invoice_savings(
+        args.actions, args.findings, args.baseline_invoice, args.current_invoice,
+        minimum_realization_percent=args.minimum_realization_percent,
+    )
+    _write_text(args.output, format_invoice_verification(rows))
+    verified = sum(row.status == "verified" for row in rows)
+    print(f"Wrote invoice verification for {len(rows)} reclaimed application/cost-center groups ({verified} verified).")
+    return 0
+
+
 def _watch(args: argparse.Namespace) -> int:
     if not math.isfinite(args.every_hours) or args.every_hours <= 0:
         raise InputError("--every-hours must be greater than zero")
@@ -696,6 +744,63 @@ def _watch(args: argparse.Namespace) -> int:
         if args.once:
             return 0
         print(f"Next scheduled analysis in {args.every_hours:g} hours. Stop with Ctrl-C.")
+        time.sleep(args.every_hours * 3600)
+
+
+def _sync_once(args: argparse.Namespace) -> tuple[int, int]:
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    if args.provider == "microsoft365":
+        imported = Microsoft365Connector.from_environment().import_exports(args.pricing, args.output_dir)
+    elif args.provider == "google-workspace":
+        imported = GoogleWorkspaceConnector.from_environment().import_exports(
+            args.pricing, args.output_dir, customer=args.customer,
+        )
+    elif args.provider == "slack":
+        imported = SlackConnector.from_environment().import_exports(
+            args.pricing, args.output_dir, lookback_days=args.lookback_days, team_id=args.team_id,
+        )
+    elif args.provider == "github-copilot":
+        if not args.organization or not args.identity_map:
+            raise InputError("github-copilot sync requires --organization and --identity-map")
+        imported = GitHubCopilotConnector.from_environment().import_exports(
+            args.organization, args.pricing, args.identity_map, args.output_dir,
+        )
+    elif args.provider == "zoom":
+        imported = ZoomConnector.from_environment().import_exports(args.pricing, args.output_dir)
+    else:
+        raise InputError(f"unsupported sync provider {args.provider!r}")
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    report_dir = args.output_dir / "reports" / stamp
+    report_args = argparse.Namespace(
+        hr=args.hr, usage=args.output_dir / "usage.csv", billing=args.output_dir / "billing.csv",
+        contract_pricing=args.contract_pricing, config=args.config, stale_days=None,
+        cost_threshold=None, low_usage_threshold=None, low_active_day_ratio=None,
+        low_features_used_threshold=None, usage_window_days=None, as_of=None,
+        review_file=args.review_file, output_csv=report_dir / "findings.csv",
+        quality_csv=report_dir / "quality.csv", output_json=report_dir / "report.json",
+        output_html=report_dir / "report.html", showback_csv=report_dir / "showback.csv",
+        renewals_csv=report_dir / "renewals.csv", snapshot_dir=args.output_dir / "snapshots",
+    )
+    _analyze(report_args)
+    return imported
+
+
+def _sync(args: argparse.Namespace) -> int:
+    if not math.isfinite(args.every_hours) or args.every_hours <= 0:
+        raise InputError("--every-hours must be greater than zero")
+    protected = {args.hr.resolve(), args.pricing.resolve()}
+    for path in (args.contract_pricing, args.config, args.review_file, args.identity_map):
+        if path:
+            protected.add(path.resolve())
+    if args.output_dir.resolve() in protected:
+        raise InputError("sync output directory cannot be an input file path")
+    while True:
+        users, assignments = _sync_once(args)
+        print(f"Synced {args.provider}: {users} users and {assignments} license assignments.")
+        if args.once:
+            return 0
+        print(f"Next provider sync in {args.every_hours:g} hours. Stop with Ctrl-C.")
         time.sleep(args.every_hours * 3600)
 
 
@@ -731,6 +836,10 @@ def main() -> int:
             return _import_health(args)
         if args.command == "realization":
             return _realization(args)
+        if args.command == "verify-savings":
+            return _verify_savings(args)
+        if args.command == "sync":
+            return _sync(args)
         return _watch(args)
     except (InputError, ConnectorError, ActionError, OSError, ValueError) as exc:
         print(f"saas-sentry: error: {exc}", file=sys.stderr)

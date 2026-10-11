@@ -21,14 +21,16 @@ SaaS Sentry combines HR, usage, contract, and billing data to flag terminated ac
 - Discover unmanaged SaaS applications and overlapping apps from a combined procurement/SSO/expense inventory.
 - Forecast renewal costs with seat-growth, reduction, contract-floor, and vendor price-increase scenarios.
 - Monitor report snapshots for material spend/seat shifts, renewal deadlines, seat-floor exposure, and invoice anomalies.
-- Execute approved Microsoft 365 and Google Workspace license reclaims and GitHub Copilot seat cancellations with preview-by-default and an idempotent audit ledger.
+- Execute approved Microsoft 365, Google Workspace, Slack, and Zoom license reclaims and GitHub Copilot seat cancellations with preview-by-default and an idempotent audit ledger.
 - Compare assigned licenses with purchased contract entitlements to identify seat overages, unused seats, and missing entitlement records.
 - Deliver monitor alerts to an HTTPS JSON webhook with preview-by-default and a local deduplication ledger.
 - Report source freshness, identity-match coverage, import quality issues, and provider metadata consistency.
 - Compare realized annual savings with estimates and break results down by owner, app, department, cost center, and month.
+- Compare reclaimed-license estimates with actual invoice spend for the matching app and cost center.
 - Import Microsoft 365 directory users, assigned SKUs, and successful sign-in dates through read-only Graph access.
 - Import Google Workspace, Slack, GitHub Copilot, and Zoom license/activity data through provider APIs.
 - Run recurring reports in a foreground scheduler.
+- Schedule recurring provider imports followed by analysis and timestamped reports.
 - Track proposed license reclaims through a separate-approver gate and compare realized savings with the estimate.
 
 ## Architecture
@@ -462,7 +464,37 @@ saas-sentry actions resolve-execution --file actions.csv \
 
 Use `--resolved-as completed` when the tenant confirms the license was removed; then refresh exports and record actual savings. `not-applied` permits another attempt with the same action idempotency key. A reconciliation must be recorded by someone other than the last execution actor.
 
-Supported providers are selected with `--provider microsoft365`, `--provider google_workspace`, or `--provider github_copilot`. Previewing does not require provider credentials. Provider mutations require `--execute`.
+Supported providers are selected with `--provider microsoft365`, `--provider google_workspace`, `--provider github_copilot`, `--provider slack`, or `--provider zoom`. Previewing does not require provider credentials. Provider mutations require `--execute`.
+
+Slack actions remove a standard member from a Slack Enterprise Grid workspace through [`admin.users.remove`](https://api.slack.com/methods/admin.users.remove), which requires the `admin.users:write` scope and a workspace/team ID. The importer records the workspace ID when available; otherwise pass `--team-id` during import. Zoom actions re-read the user and change the account type from Licensed (`2`) to Basic (`1`) through the [Zoom Update User API](https://developers.zoom.us/docs/api/users/). Both adapters verify the live target before mutation and skip or refuse changed account states.
+
+### Verify savings against invoices
+
+`verify-savings` compares normalized FOCUS invoice exports from two non-overlapping billing periods. It joins reclaimed action records to findings by `finding_id`, then groups billed cost by application and cost center. The current invoice file must be a complete export for its period; if an application/cost-center pair is absent from it, the command treats its spend as zero. The observed reduction is the difference in daily spend rates annualized to 365 days.
+
+```bash
+saas-sentry focus import --input examples/focus-billing.csv \
+  --output focus-before.csv --config config.example.toml
+# Normalize the next period's vendor invoice export to the same FOCUS schema as focus-before.csv.
+saas-sentry verify-savings --actions actions.csv --findings findings.csv \
+  --baseline-invoice focus-before.csv --current-invoice focus-after.csv \
+  --minimum-realization-percent 80 --output invoice-verification.csv
+```
+
+The report includes baseline/current spend, modeled annual savings, annualized invoice reduction, variance, realization percentage, and a status. `verified` means the observed reduction meets the configured percentage; `partial`, `spend_increased`, and `no_reduction_observed` identify other outcomes. This is app/cost-center level evidence, not proof that a particular reclaim caused the entire invoice change: price changes, seat changes, credits, and unrelated usage can affect the same spend group. Review billing details before recording realized savings.
+
+### Scheduled provider syncs
+
+Run provider import and analysis once with `--once`, or keep the process running with `--every-hours`. Each cycle writes refreshed `usage.csv`, `billing.csv`, and provider metadata under the output directory, then creates a timestamped analysis/report directory and snapshot history. Scheduling runs in the foreground; use a process supervisor or scheduler for persistent operation.
+
+```bash
+saas-sentry sync --provider microsoft365 --hr examples/hr.csv \
+  --pricing examples/provider-pricing.csv --contract-pricing examples/contract-pricing.csv \
+  --config config.example.toml --output-dir scheduled/microsoft365 \
+  --every-hours 24 --once
+```
+
+Available providers are `microsoft365`, `google-workspace`, `slack`, `github-copilot`, and `zoom`. Provider credentials come from the same environment variables as their `connect` commands. GitHub Copilot sync also requires `--organization` and `--identity-map`; Slack accepts `--team-id`. Each cycle performs a fresh provider import, so API permissions, rate limits, and source-data freshness apply. For an operator-managed scheduled analysis that uses already-imported CSVs without calling a provider, use `watch`.
 
 ### Contract entitlement and overage tracking
 

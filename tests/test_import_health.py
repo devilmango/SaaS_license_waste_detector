@@ -39,12 +39,13 @@ class ImportHealthTests(unittest.TestCase):
         ], [["alice@example.com", "Slack", "active", "12000"],
             ["missing@example.com", "Notion", "active", "1000"]])
         metadata = self.root / "import.json"
+        as_of = date.today()
         metadata.write_text(json.dumps({
-            "provider": "slack", "imported_at": "2026-10-08T10:00:00Z",
+            "provider": "slack", "imported_at": f"{as_of.isoformat()}T10:00:00Z",
             "license_assignment_count": 1,
         }), encoding="utf-8")
         rows = build_import_health(
-            hr, usage, billing, metadata_path=metadata, as_of=date(2026, 10, 8), stale_after_days=2,
+            hr, usage, billing, metadata_path=metadata, as_of=as_of, stale_after_days=2,
         )
         health = {row.source: row for row in rows}
         self.assertEqual(health["usage"].matched_records, 1)

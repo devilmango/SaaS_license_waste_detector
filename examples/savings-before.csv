@@ -1,0 +1,4 @@
+application,cost_center,billing_period_start,billing_period_end,actual_billed_cost_inr
+Slack,ENG-100,2026-08-01,2026-09-01,24000
+Slack,PRD-300,2026-08-01,2026-09-01,8000
+Notion,PRD-300,2026-08-01,2026-09-01,12000

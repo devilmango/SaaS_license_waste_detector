@@ -151,6 +151,8 @@ class ProviderExecutionTests(unittest.TestCase):
         cases = [
             ("google_workspace", "person@example.com", '["Google-Apps", "Business"]'),
             ("github_copilot", "octocat", "example-org"),
+            ("slack", "U12345", "T12345"),
+            ("zoom", "zoom-user-1", "2"),
         ]
         for provider, user_id, license_id in cases:
             with self.subTest(provider=provider):

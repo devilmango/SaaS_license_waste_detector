@@ -64,7 +64,7 @@ def build_execution_plan(
     provider: str = "microsoft365",
 ) -> ExecutionPlan:
     """Resolve an approved action to exactly one imported provider user/license target."""
-    if provider not in {"microsoft365", "google_workspace", "github_copilot"}:
+    if provider not in {"microsoft365", "google_workspace", "github_copilot", "slack", "zoom"}:
         raise ActionError(f"Unsupported reclaim provider {provider!r}")
     action = next((item for item in list_actions(action_ledger) if item.action_id == action_id), None)
     if not action:
@@ -224,7 +224,7 @@ def resolve_execution(
     note: str,
 ) -> None:
     """Record an independent human reconciliation of an ambiguous provider result."""
-    if provider not in {"microsoft365", "google_workspace", "github_copilot"}:
+    if provider not in {"microsoft365", "google_workspace", "github_copilot", "slack", "zoom"}:
         raise ActionError(f"Unsupported reclaim provider {provider!r}")
     if resolved_as not in {"completed", "not_applied"}:
         raise ActionError("resolved_as must be completed or not_applied")

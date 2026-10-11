@@ -75,6 +75,25 @@ def _bearer_mutation(
         raise ConnectorError(f"{provider} API request failed: {type(exc).__name__}") from exc
 
 
+def _slack_admin_remove_user(token: str, team_id: str, user_id: str) -> None:
+    body = urlencode({"team_id": team_id, "user_id": user_id}).encode("utf-8")
+    request = Request(
+        "https://slack.com/api/admin.users.remove", data=body,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=30) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        raise ConnectorError(f"Slack API returned HTTP {exc.code}") from exc
+    except (URLError, TimeoutError, OSError, ValueError) as exc:
+        raise ConnectorError(f"Slack API request failed: {type(exc).__name__}") from exc
+    if not isinstance(payload, dict) or not payload.get("ok"):
+        error = payload.get("error", "unknown_error") if isinstance(payload, dict) else "invalid_response"
+        raise ConnectorError(f"Slack admin.users.remove failed ({error})")
+
+
 def _required_token(name: str, provider: str) -> str:
     token = os.environ.get(name, "")
     if not token:
@@ -629,13 +648,37 @@ class SlackConnector:
                 str(user_activity["active_days"]), str(lookback_days),
                 str(len(user_activity["features"])),
             ])
-            billing_rows.append(_billing_export_row({"email": email}, price, application))
+            workspace = str(member.get("team_id", "")) or team_id
+            billing_rows.append(_billing_export_row({"email": email}, price, application) + [
+                "slack", user_id, workspace,
+            ])
         if not billing_rows:
             raise ConnectorError("Slack import found no billable members in the requested analytics window")
         return _write_provider_exports(
             "slack", output_dir, usage_rows, billing_rows,
             f"Daily Slack member analytics over {lookback_days} days; latest active date is a usage signal, not a login timestamp",
         )
+
+    def remove_user_license(self, user_id: str, sku_id: str) -> str:
+        """Remove a single Slack Grid member after checking the live user record."""
+        team_id = sku_id.strip()
+        if not user_id.strip() or not team_id:
+            raise ConnectorError("Slack reclaim target requires a user ID and workspace team ID")
+        payload = _bearer_json(
+            f"https://slack.com/api/users.info?{urlencode({'user': user_id})}",
+            self.access_token, "Slack", self.HOSTS,
+        )
+        if not payload.get("ok") or not isinstance(payload.get("user"), dict):
+            raise ConnectorError(f"Slack users.info failed ({payload.get('error', 'invalid_response')})")
+        user = payload["user"]
+        if str(user.get("id", "")) != user_id:
+            raise ConnectorError("Slack returned a different user than the requested reclaim target")
+        if user.get("deleted"):
+            return "user_already_removed"
+        if user.get("is_bot") or user.get("is_restricted") or user.get("is_ultra_restricted"):
+            raise ConnectorError("Slack target is not a standard billable member; refusing removal")
+        _slack_admin_remove_user(self.access_token, team_id, user_id)
+        return "user_removed_from_workspace"
 
 
 class GitHubCopilotConnector:
@@ -864,10 +907,36 @@ class ZoomConnector:
             identity = {"email": email, "employee_id": str(user.get("employee_unique_id", ""))}
             usage_rows.append([employee or email, identity["employee_id"], email, application,
                                last_login, "", "", "", ""])
-            billing_rows.append(_billing_export_row(identity, price, application))
+            user_id = str(user.get("id", ""))
+            if not user_id:
+                raise ConnectorError("An active Zoom licensed user is missing its stable user ID")
+            billing_rows.append(_billing_export_row(identity, price, application) + ["zoom", user_id, str(user_type)])
         if missing_types:
             raise ConnectorError("Add Zoom pricing mappings for licensed user types: " + ", ".join(map(str, sorted(missing_types))))
         return _write_provider_exports(
             "zoom", output_dir, usage_rows, billing_rows,
             "Zoom user last_login_time (provider reports this with a three-day buffer)",
         )
+
+    def remove_user_license(self, user_id: str, sku_id: str) -> str:
+        """Convert one verified Zoom Licensed user to Basic to release its paid user license."""
+        if not user_id.strip() or sku_id != "2":
+            raise ConnectorError("Zoom reclaim target must identify an imported Licensed user")
+        token = self._token()
+        url = f"https://api.zoom.us/v2/users/{quote(user_id, safe='')}"
+        current = _bearer_json(url, token, "Zoom", self.HOSTS)
+        if str(current.get("id", "")) != user_id:
+            raise ConnectorError("Zoom returned a different user than the requested reclaim target")
+        try:
+            user_type = int(current.get("type", 0))
+        except (TypeError, ValueError) as exc:
+            raise ConnectorError("Zoom returned an invalid current user type") from exc
+        if user_type == 1:
+            return "user_already_basic"
+        if user_type != 2:
+            raise ConnectorError("Zoom user is no longer Licensed; refusing an unexpected user-type change")
+        _bearer_mutation(
+            url, token, "Zoom", self.HOSTS, method="PATCH",
+            body=json.dumps({"type": 1}).encode("utf-8"),
+        )
+        return "license_changed_to_basic"

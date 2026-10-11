@@ -85,6 +85,9 @@ jobs:
             --billing examples/billing.csv --output import-health.csv
           saas-sentry realization --actions actions.csv --findings findings.csv \
             --output savings-realization.csv
+          saas-sentry verify-savings --actions actions.csv --findings findings.csv \
+            --baseline-invoice examples/savings-before.csv \
+            --current-invoice examples/savings-after.csv --output invoice-verification.csv
 
       - name: Validate provider and action CLI help
         run: |
@@ -100,6 +103,8 @@ jobs:
           saas-sentry entitlements --help
           saas-sentry import-health --help
           saas-sentry realization --help
+          saas-sentry verify-savings --help
+          saas-sentry sync --help
 
       - name: Run scheduled report once
         run: >-

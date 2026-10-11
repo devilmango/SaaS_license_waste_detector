@@ -91,6 +91,9 @@ class ProviderConnectorTests(unittest.TestCase):
         self.assertEqual(usage["last_login"], "2026-10-04")
         self.assertEqual(usage["active_days"], "1")
         self.assertEqual(usage["usage_count"], "2")
+        billing = self.read_csv(output / "billing.csv")[0]
+        self.assertEqual(billing["provider"], "slack")
+        self.assertEqual(billing["provider_user_id"], "U1")
 
     def test_github_copilot_import_requires_identity_mapping(self) -> None:
         pricing = self.write_csv(self.root / "github-pricing.csv", ["application", "annual_cost"], [
@@ -146,6 +149,29 @@ class ProviderConnectorTests(unittest.TestCase):
         verify.assert_called_once()
         mutation.assert_not_called()
 
+    def test_slack_reclaim_verifies_live_member_before_removal(self) -> None:
+        connector = SlackConnector("token")
+        with patch("saas_sentry.connectors._bearer_json", return_value={
+            "ok": True, "user": {"id": "U1", "deleted": False},
+        }) as verify, patch("saas_sentry.connectors._slack_admin_remove_user") as remove:
+            result = connector.remove_user_license("U1", "T123")
+        self.assertEqual(result, "user_removed_from_workspace")
+        self.assertIn("users.info", verify.call_args.args[0])
+        remove.assert_called_once_with("token", "T123", "U1")
+
+    def test_slack_reclaim_refuses_deleted_or_nonstandard_member_without_mutation(self) -> None:
+        connector = SlackConnector("token")
+        for user in ({"id": "U1", "deleted": True}, {"id": "U1", "is_bot": True}):
+            with self.subTest(user=user), patch(
+                "saas_sentry.connectors._bearer_json", return_value={"ok": True, "user": user},
+            ), patch("saas_sentry.connectors._slack_admin_remove_user") as remove:
+                if user.get("deleted"):
+                    self.assertEqual(connector.remove_user_license("U1", "T123"), "user_already_removed")
+                else:
+                    with self.assertRaisesRegex(Exception, "standard billable member"):
+                        connector.remove_user_license("U1", "T123")
+                remove.assert_not_called()
+
     def test_zoom_imports_licensed_users_only(self) -> None:
         pricing = self.write_csv(self.root / "zoom-pricing.csv", ["user_type", "application", "annual_cost"], [
             ["2", "Zoom Workplace", "18000"],
@@ -153,7 +179,7 @@ class ProviderConnectorTests(unittest.TestCase):
         connector = ZoomConnector("account", "client", "secret")
         with patch.object(connector, "_token", return_value="token"), patch(
             "saas_sentry.connectors._bearer_json", return_value={"users": [
-                {"email": "licensed@example.com", "type": 2, "status": "active",
+                {"id": "zoom-user-1", "email": "licensed@example.com", "type": 2, "status": "active",
                  "last_login_time": "2026-10-01T10:00:00Z"},
                 {"email": "basic@example.com", "type": 1, "status": "active"},
             ]},
@@ -179,6 +205,25 @@ class ProviderConnectorTests(unittest.TestCase):
         request = mocked.call_args.args[0]
         self.assertEqual(request.get_method(), "POST")
         self.assertNotIn("client-secret", request.full_url)
+
+    def test_zoom_reclaim_rechecks_type_then_downgrades_to_basic(self) -> None:
+        connector = ZoomConnector("account", "client", "secret")
+        with patch.object(connector, "_token", return_value="token"), patch(
+            "saas_sentry.connectors._bearer_json", return_value={"id": "123", "type": 2},
+        ) as verify, patch("saas_sentry.connectors._bearer_mutation") as mutation:
+            result = connector.remove_user_license("123", "2")
+        self.assertEqual(result, "license_changed_to_basic")
+        self.assertIn("/users/123", verify.call_args.args[0])
+        self.assertEqual(mutation.call_args.kwargs["method"], "PATCH")
+        self.assertEqual(json.loads(mutation.call_args.kwargs["body"]), {"type": 1})
+
+    def test_zoom_reclaim_skips_already_basic_user(self) -> None:
+        connector = ZoomConnector("account", "client", "secret")
+        with patch.object(connector, "_token", return_value="token"), patch(
+            "saas_sentry.connectors._bearer_json", return_value={"id": "123", "type": 1},
+        ), patch("saas_sentry.connectors._bearer_mutation") as mutation:
+            self.assertEqual(connector.remove_user_license("123", "2"), "user_already_basic")
+        mutation.assert_not_called()
 
 
 if __name__ == "__main__":
