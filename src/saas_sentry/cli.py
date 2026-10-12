@@ -47,6 +47,15 @@ from .contracts import (
     record_contract_version,
     reconcile_contract_invoices,
 )
+from .procurement import format_procurement, normalize_procurement_csv
+from .reassignment import format_reassignments, plan_reassignments
+from .renewals import (
+    create_renewal_campaign,
+    format_renewals,
+    list_renewals,
+    record_budget_approval,
+    record_owner_decision,
+)
 from .storage import migrate_csv_ledger
 from .engine import (
     InputError,
@@ -375,6 +384,59 @@ def build_parser() -> argparse.ArgumentParser:
     ledger_migrate.add_argument("--kind", choices=("actions", "access-review"), required=True)
     ledger_migrate.add_argument("--source", type=Path, required=True)
     ledger_migrate.add_argument("--database", type=Path, required=True, help="shared .db, .sqlite, or .sqlite3 destination")
+
+    reassign = subparsers.add_parser(
+        "reassign", help="match confirmed reclaim candidates to active license requests",
+    )
+    reassign.add_argument("--hr", type=Path, required=True)
+    reassign.add_argument("--usage", type=Path, required=True)
+    reassign.add_argument("--billing", type=Path, required=True)
+    reassign.add_argument("--config", type=Path, help="dated currency rates for billing conversion")
+    reassign.add_argument("--findings", type=Path, required=True)
+    reassign.add_argument("--demand", type=Path, required=True, help="CSV of active employees requesting a license")
+    reassign.add_argument("--output", type=Path, required=True)
+
+    procurement = subparsers.add_parser(
+        "procurement", help="normalize invoice exports from procurement and AP tools",
+    )
+    procurement_import = procurement.add_subparsers(dest="procurement_command", required=True).add_parser(
+        "import", help="normalize a Coupa, NetSuite, Ariba, or canonical CSV export",
+    )
+    procurement_import.add_argument("--system", choices=("canonical", "coupa", "netsuite", "ariba"), default="canonical")
+    procurement_import.add_argument("--input", type=Path, required=True)
+    procurement_import.add_argument("--config", type=Path, help="dated currency rates for conversion to INR")
+    procurement_import.add_argument("--output", type=Path, required=True)
+
+    renewals = subparsers.add_parser("renewals", help="run owner and budget approval workflows for renewals")
+    renewal_commands = renewals.add_subparsers(dest="renewals_command", required=True)
+    renewal_create = renewal_commands.add_parser("create", help="create campaigns from upcoming contract notice dates")
+    renewal_create.add_argument("--contracts", type=Path, default=Path("contract-events.csv"))
+    renewal_create.add_argument("--ledger", type=Path, default=Path("renewal-events.csv"))
+    renewal_create.add_argument("--as-of", type=date.fromisoformat, default=date.today())
+    renewal_create.add_argument("--horizon-days", type=_nonnegative, default=90)
+    renewal_create.add_argument("--created-by", required=True)
+    renewal_list = renewal_commands.add_parser("list", help="export the renewal audit trail and overdue statuses")
+    renewal_list.add_argument("--ledger", type=Path, default=Path("renewal-events.csv"))
+    renewal_list.add_argument("--as-of", type=date.fromisoformat)
+    renewal_list.add_argument("--output", type=Path)
+    renewal_decide = renewal_commands.add_parser("decide", help="record the assigned owner's renewal recommendation")
+    renewal_decide.add_argument("--ledger", type=Path, default=Path("renewal-events.csv"))
+    renewal_decide.add_argument("--contract-id", required=True)
+    renewal_decide.add_argument("--version", type=_nonnegative, required=True)
+    renewal_decide.add_argument("--decision", choices=("renew", "renegotiate", "cancel"), required=True)
+    renewal_decide.add_argument("--decided-by", required=True)
+    renewal_decide.add_argument("--evidence-ref", required=True)
+    renewal_decide.add_argument("--note", default="")
+    renewal_decide.add_argument("--on", type=date.fromisoformat)
+    renewal_approve = renewal_commands.add_parser("approve", help="record a separate budget approval or rejection")
+    renewal_approve.add_argument("--ledger", type=Path, default=Path("renewal-events.csv"))
+    renewal_approve.add_argument("--contract-id", required=True)
+    renewal_approve.add_argument("--version", type=_nonnegative, required=True)
+    renewal_approve.add_argument("--status", choices=("approved", "rejected"), required=True)
+    renewal_approve.add_argument("--approved-by", required=True)
+    renewal_approve.add_argument("--evidence-ref", required=True)
+    renewal_approve.add_argument("--note", default="")
+    renewal_approve.add_argument("--on", type=date.fromisoformat)
 
     realization = subparsers.add_parser(
         "realization", help="compare modeled and actual annual savings from reclaim actions",
@@ -920,6 +982,72 @@ def _ledger(args: argparse.Namespace) -> int:
     return 0
 
 
+def _reassign(args: argparse.Namespace) -> int:
+    inputs = (args.hr, args.usage, args.billing, args.findings, args.demand, args.config)
+    if args.output.resolve() in {path.resolve() for path in inputs if path is not None}:
+        raise InputError("reassignment report cannot overwrite an input")
+    _, currency = load_config(args.config)
+    rows = plan_reassignments(
+        hr_path=args.hr, usage_path=args.usage, billing_path=args.billing,
+        findings_path=args.findings, demand_path=args.demand, currency=currency,
+    )
+    _write_text(args.output, format_reassignments(rows))
+    matched = sum(row.status == "proposed" for row in rows)
+    print(f"Proposed {matched} seat reassignments; no provider changes were made. Report: {args.output}")
+    return 0
+
+
+def _procurement(args: argparse.Namespace) -> int:
+    if args.output.resolve() in {args.input.resolve(), args.config.resolve() if args.config else None}:
+        raise InputError("normalized procurement output cannot overwrite an input")
+    _, currency = load_config(args.config)
+    rows = normalize_procurement_csv(args.input, system=args.system, currency=currency)
+    _write_text(args.output, format_procurement(rows))
+    print(f"Normalized {len(rows)} invoice lines from {args.system} into {args.output}.")
+    return 0
+
+
+def _renewals(args: argparse.Namespace) -> int:
+    if args.renewals_command == "create":
+        if args.contracts.resolve() == args.ledger.resolve():
+            raise InputError("renewal workflow ledger must be separate from the contract evidence ledger")
+        count = create_renewal_campaign(
+            args.contracts, args.ledger, as_of=args.as_of,
+            horizon_days=args.horizon_days, created_by=args.created_by,
+        )
+        print(f"Created {count} renewal campaigns in {args.ledger}.")
+        return 0
+    if args.renewals_command == "decide":
+        record_owner_decision(
+            args.ledger, args.contract_id, args.version, decision=args.decision,
+            decided_by=args.decided_by, evidence_ref=args.evidence_ref,
+            note=args.note, on=args.on,
+        )
+        print(f"Recorded {args.decision} recommendation for {args.contract_id} version {args.version}.")
+        return 0
+    if args.renewals_command == "approve":
+        record_budget_approval(
+            args.ledger, args.contract_id, args.version, status=args.status,
+            approved_by=args.approved_by, evidence_ref=args.evidence_ref,
+            note=args.note, on=args.on,
+        )
+        print(f"Recorded budget {args.status} for {args.contract_id} version {args.version}.")
+        return 0
+    rows = list_renewals(args.ledger, as_of=args.as_of)
+    content = format_renewals(rows)
+    if args.output:
+        if args.output.resolve() == args.ledger.resolve():
+            raise InputError("renewal export cannot overwrite its event ledger")
+        _write_text(args.output, content)
+        print(f"Exported {len(rows)} renewal campaigns to {args.output}.")
+    else:
+        sys.stdout.write(content)
+    overdue = sum(row.status == "overdue_owner_decision" for row in rows)
+    if overdue:
+        print(f"{overdue} renewal owner decisions are overdue.", file=sys.stderr)
+    return 0
+
+
 def _realization(args: argparse.Namespace) -> int:
     if args.output.resolve() in {args.actions.resolve(), args.findings.resolve()}:
         raise InputError("savings realization output cannot overwrite an input file")
@@ -1160,6 +1288,12 @@ def main() -> int:
             return _contracts(args)
         if args.command == "ledger":
             return _ledger(args)
+        if args.command == "reassign":
+            return _reassign(args)
+        if args.command == "procurement":
+            return _procurement(args)
+        if args.command == "renewals":
+            return _renewals(args)
         if args.command == "realization":
             return _realization(args)
         if args.command == "verify-savings":

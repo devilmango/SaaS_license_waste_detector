@@ -103,6 +103,35 @@ jobs:
           saas-sentry access-review deliver-reminders --reminders access-review-reminders.csv \
             --ledger access-review-deliveries.csv --webhook-url https://example.invalid/reviews
 
+      - name: Validate procurement imports, seat reassignment, and renewal approvals
+        run: |
+          saas-sentry procurement import --system coupa \
+            --input examples/procurement-coupa.csv --config config.example.toml \
+            --output procurement-invoices.csv
+          saas-sentry reassign --hr examples/hr.csv --usage examples/usage.csv \
+            --billing examples/billing.csv --findings examples/reassignment-findings.csv \
+            --demand examples/license-demand.csv --config config.example.toml \
+            --output reassignment-plan.csv
+          saas-sentry contracts record --ledger renewal-contracts.csv \
+            --contract-id ci-slack --vendor "Slack Inc" --owner finops@example.com \
+            --application Slack --effective-date 2026-01-01 --renewal-date 2026-11-15 \
+            --notice-days 30 --annual-commitment-inr 120000 --currency INR \
+            --evidence-type order_form --evidence-ref evidence/ci-slack-order-form.pdf \
+            --recorded-by procurement@example.com --on 2026-10-04
+          saas-sentry renewals create --contracts renewal-contracts.csv \
+            --ledger renewal-events.csv --as-of 2026-10-04 --horizon-days 90 \
+            --created-by ci@example.com
+          saas-sentry renewals decide --ledger renewal-events.csv \
+            --contract-id ci-slack --version 1 --decision renegotiate \
+            --decided-by finops@example.com --evidence-ref evidence/ci-renewal-review.pdf \
+            --on 2026-10-04
+          saas-sentry renewals approve --ledger renewal-events.csv \
+            --contract-id ci-slack --version 1 --status approved \
+            --approved-by finance@example.com --evidence-ref evidence/ci-budget-approval.pdf \
+            --on 2026-10-04
+          saas-sentry renewals list --ledger renewal-events.csv \
+            --as-of 2026-10-04 --output renewal-audit.csv
+
       - name: Validate provider and action CLI help
         run: |
           saas-sentry connect google-workspace --help
@@ -131,6 +160,13 @@ jobs:
           saas-sentry contracts record --help
           saas-sentry contracts approve --help
           saas-sentry contracts reconcile --help
+          saas-sentry reassign --help
+          saas-sentry procurement --help
+          saas-sentry procurement import --help
+          saas-sentry renewals --help
+          saas-sentry renewals create --help
+          saas-sentry renewals decide --help
+          saas-sentry renewals approve --help
           saas-sentry contract-model --help
 
       - name: Run scheduled report once

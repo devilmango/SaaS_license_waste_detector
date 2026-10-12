@@ -1,0 +1,2 @@
+employee_id,email,application,contract_id,priority,requested_on,reason
+E001,alice@company.com,Google Workspace,workspace-annual,high,2026-10-01,Needs Workspace access for a new project

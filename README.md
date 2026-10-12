@@ -619,6 +619,58 @@ saas-sentry contracts reconcile --ledger contract-events.csv \
 
 Invoice checks compare the latest contract version's annual commitment, prorated across the invoice period, with actual normalized FOCUS spend. Pending versions remain marked `pending_approval`. When the FOCUS `Tags` data includes a contract identifier, pass `--contract-id-tag` during import to keep spend distinct even when multiple contracts cover the same service. Without contract tags, application names must map to only one contract. The report includes over/under commitment status, variance, renewal date, notice deadline, and evidence reference. This is a reconciliation signal; review tax, credits, discounts, and the source document before changing a subscription.
 
+### Seat reassignment planning
+
+Match a confirmed reclaim finding to an employee request for the same application and contract. The planner requires `review_status=confirmed`, verifies that the source finding still points to an active billed seat, and checks that the requester is active in HR and does not already hold that seat. It prioritizes high, then normal, then low requests and proposes each source seat at most once.
+
+Create a request export with `employee_id,email,application,contract_id,priority,requested_on,reason` columns. Use the exact contract ID from billing so a seat is not moved across contract pools. Generate findings with the normal `analyze --output-csv` command after recording a review decision as confirmed.
+
+```csv
+employee_id,email,application,contract_id,priority,requested_on,reason
+E010,new.hire@company.com,Slack,slack-enterprise,high,2026-10-01,New hire needs a collaboration seat
+```
+
+```bash
+saas-sentry reassign --hr hr.csv --usage usage.csv --billing billing.csv \
+  --findings findings.csv --demand license-demand.csv \
+  --config config.example.toml --output reassignment-plan.csv
+```
+
+The output includes matched proposals, reclaim supply without a matching request, and requests without a matching confirmed seat. It is a planning report; it does not change provider assignments. Review contract terms and then execute an approved change through the existing action workflow.
+
+### Procurement and AP invoice imports
+
+Normalize exported CSV invoice lines from Coupa, NetSuite, Ariba, or the canonical schema into the same invoice columns used by contract reconciliation. Export headings vary by tenant; the importer recognizes common heading aliases and reports missing required fields. Required values are vendor, application/service, contract ID, invoice ID, billing period start and end, amount, and currency. Optional owner, cost center, renewal date, notice period, and evidence link are carried through for finance follow-up.
+
+```bash
+saas-sentry procurement import --system coupa --input coupa-invoices.csv \
+  --config config.example.toml --output normalized-invoices.csv
+saas-sentry contracts reconcile --ledger contract-events.csv \
+  --invoice normalized-invoices.csv --output contract-invoice-check.csv
+```
+
+Amounts are converted to INR using the dated rates in the TOML configuration; non-INR inputs fail when a rate is missing. The original currency remains in `source_currency`. These adapters consume system exports and make no network calls. For a custom export, select `--system canonical` and use the normalized field names, or adjust the export headings to one of the recognized aliases.
+
+### Renewal owner and budget approvals
+
+Create an append-only renewal campaign from the latest version of each contract when its notice deadline falls within the selected horizon or is already overdue. The assigned contract owner records a recommendation with evidence; a different budget approver then approves or rejects it with a separate evidence reference.
+
+```bash
+saas-sentry renewals create --contracts contract-events.csv \
+  --ledger renewal-events.csv --as-of 2026-10-01 --horizon-days 90 \
+  --created-by finops@example.com
+saas-sentry renewals list --ledger renewal-events.csv --as-of 2026-10-01 \
+  --output renewal-audit.csv
+saas-sentry renewals decide --ledger renewal-events.csv \
+  --contract-id slack-enterprise --version 1 --decision renegotiate \
+  --decided-by app-owner@example.com --evidence-ref evidence/renewal-review.pdf
+saas-sentry renewals approve --ledger renewal-events.csv \
+  --contract-id slack-enterprise --version 1 --status approved \
+  --approved-by finance@example.com --evidence-ref evidence/budget-approval.pdf
+```
+
+The exported audit report identifies pending owner decisions, overdue notice deadlines, pending budget approvals, and completed or rejected decisions. Campaign events retain the contract version, owner, dates, decision actors, notes, and evidence references. Creating a campaign is idempotent for a given contract version.
+
 ### Shared pools and prorated contract changes
 
 `contract-model` projects charges for an invoice period from active billing assignments, fixed or tiered seat entitlements, the existing `contract-pricing.csv` volume tiers, and a dated change log. Add `pool_id` to entitlement rows to share entitlements across applications. Active identities are deduplicated within each pool. Change events support `seat_add`, `seat_remove`, `entitlement_change`, and `price_change`; seat and entitlement events target a `pool_id` when the contract has multiple pools. Price changes apply contract-wide from their effective date for the rest of the modeled period. Changes outside the selected invoice period are ignored.
