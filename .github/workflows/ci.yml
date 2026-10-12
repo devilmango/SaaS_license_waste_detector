@@ -100,6 +100,8 @@ jobs:
             --owner-map examples/application-owners.csv --default-owner finops@example.com
           saas-sentry access-review reminders --ledger access-review-events.csv \
             --as-of 2026-10-15 --within-days 7 --output access-review-reminders.csv
+          saas-sentry access-review deliver-reminders --reminders access-review-reminders.csv \
+            --ledger access-review-deliveries.csv --webhook-url https://example.invalid/reviews
 
       - name: Validate provider and action CLI help
         run: |
@@ -110,6 +112,7 @@ jobs:
           saas-sentry actions --help
           saas-sentry actions execute --help
           saas-sentry actions resolve-execution --help
+          saas-sentry actions verify-provider --help
           saas-sentry monitor --help
           saas-sentry notify --help
           saas-sentry entitlements --help
@@ -118,6 +121,7 @@ jobs:
           saas-sentry verify-savings --help
           saas-sentry sync --help
           saas-sentry access-review --help
+          saas-sentry access-review deliver-reminders --help
           saas-sentry contract-model --help
 
       - name: Run scheduled report once

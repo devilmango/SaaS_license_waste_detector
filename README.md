@@ -23,7 +23,7 @@ SaaS Sentry combines HR, usage, contract, and billing data to flag terminated ac
 - Monitor report snapshots for material spend/seat shifts, renewal deadlines, seat-floor exposure, and invoice anomalies.
 - Execute approved Microsoft 365, Google Workspace, Slack, and Zoom license reclaims and GitHub Copilot seat cancellations with preview-by-default and an idempotent audit ledger.
 - Compare assigned licenses with purchased contract entitlements to identify seat overages, unused seats, and missing entitlement records.
-- Run owner-assigned access-review campaigns with due dates, cooldown-aware reminder queues, and decisions linked to the review ledger.
+- Run owner-assigned access-review campaigns with due dates, cooldown-aware reminder queues, owner-grouped webhook delivery, and decisions linked to the review ledger.
 - Model shared seat pools, volume price tiers, and prorated charges from effective-dated mid-term seat, entitlement, and price changes.
 - Deliver monitor alerts to an HTTPS JSON webhook with preview-by-default and a local deduplication ledger.
 - Report source freshness, identity-match coverage, import quality issues, and provider metadata consistency.
@@ -32,7 +32,7 @@ SaaS Sentry combines HR, usage, contract, and billing data to flag terminated ac
 - Import Microsoft 365 directory users, assigned SKUs, and successful sign-in dates through read-only Graph access.
 - Import Google Workspace, Slack, GitHub Copilot, and Zoom license/activity data through provider APIs.
 - Run recurring reports in a foreground scheduler.
-- Schedule recurring provider imports followed by analysis and timestamped reports.
+- Schedule recurring provider imports followed by analysis, timestamped reports, and optional reclaim verification.
 - Track proposed license reclaims through a separate-approver gate and compare realized savings with the estimate.
 
 ## Architecture
@@ -470,6 +470,18 @@ Supported providers are selected with `--provider microsoft365`, `--provider goo
 
 Slack actions remove a standard member from a Slack Enterprise Grid workspace through [`admin.users.remove`](https://api.slack.com/methods/admin.users.remove), which requires the `admin.users:write` scope and a workspace/team ID. The importer records the workspace ID when available; otherwise pass `--team-id` during import. Zoom actions re-read the user and change the account type from Licensed (`2`) to Basic (`1`) through the [Zoom Update User API](https://developers.zoom.us/docs/api/users/). Both adapters verify the live target before mutation and skip or refuse changed account states.
 
+After a provider sync, verify executed actions against its complete `billing.csv` snapshot. The command uses the sibling `import.json` metadata to check the provider and assignment count, then appends each result to a verification event ledger and writes a CSV for follow-up:
+
+```bash
+saas-sentry actions verify-provider --file actions.csv \
+  --execution-ledger execution-events.csv --findings findings.csv \
+  --billing imports/microsoft365/billing.csv --provider microsoft365 \
+  --verification-ledger reclaim-verification-events.csv \
+  --output reclaim-verification.csv
+```
+
+`verified_reclaimed` means the exact provider user/license assignment is absent from the complete refreshed snapshot. `still_assigned`, `assignment_changed`, and `identity_mismatch` remain open for operator review and include a follow-up instruction. This records provider state without automatically marking the approval action reclaimed; refresh billing and enter realized savings separately after invoice review.
+
 ### Verify savings against invoices
 
 `verify-savings` compares normalized FOCUS invoice exports from two non-overlapping billing periods. It joins reclaimed action records to findings by `finding_id`, then groups billed cost by application and cost center. The current invoice file must be a complete export for its period; if an application/cost-center pair is absent from it, the command treats its spend as zero. The observed reduction is the difference in daily spend rates annualized to 365 days.
@@ -487,7 +499,15 @@ The report includes baseline/current spend, modeled annual savings, annualized i
 
 ### Scheduled provider syncs
 
-Run provider import and analysis once with `--once`, or keep the process running with `--every-hours`. Each cycle writes refreshed `usage.csv`, `billing.csv`, and provider metadata under the output directory, then creates a timestamped analysis/report directory and snapshot history. Scheduling runs in the foreground; use a process supervisor or scheduler for persistent operation.
+Run provider import and analysis once with `--once`, or keep the process running with `--every-hours`. Each cycle writes refreshed `usage.csv`, `billing.csv`, and provider metadata under the output directory, then creates a timestamped analysis/report directory and snapshot history. Scheduling runs in the foreground; use a process supervisor or scheduler for persistent operation. Add both action and execution ledgers to verify completed reclaims after each fresh import:
+
+```bash
+saas-sentry sync --provider microsoft365 --hr hr.csv --pricing m365-pricing.csv \
+  --output-dir imports/microsoft365 --action-ledger actions.csv \
+  --execution-ledger execution-events.csv --once
+```
+
+Each cycle writes `reports/<run-id>/reclaim-verification.csv` and appends outcomes to `reclaim-verification-events.csv` under the sync output directory by default. Use `--verification-ledger` to choose a different event-log path. Both ledgers are optional, but must be supplied together. A changed assignment stays in the report as a follow-up; it is never automatically retried or marked reclaimed.
 
 ```bash
 saas-sentry sync --provider microsoft365 --hr examples/hr.csv \
@@ -529,7 +549,19 @@ saas-sentry access-review decide --ledger access-review-events.csv \
   --decision confirmed --reviewed-by app-owner@example.com --note "Still required"
 ```
 
-The reminder command writes a local queue for an operator to deliver and records when each queue entry was generated. It does not email owners or post to chat systems. Repeated runs respect the configured minimum gap; overdue items remain in the queue until an owner decides them.
+The reminders command writes a local queue and records when each queue entry was generated. Deliver the queue to an owner-grouped HTTPS JSON webhook with a preview-first command:
+
+```bash
+saas-sentry access-review deliver-reminders --reminders owner-reminders.csv \
+  --ledger access-review-deliveries.csv \
+  --webhook-url https://hooks.example.com/saas-sentry/reviews
+# Review the preview, then opt in to network delivery:
+saas-sentry access-review deliver-reminders --reminders owner-reminders.csv \
+  --ledger access-review-deliveries.csv \
+  --webhook-url https://hooks.example.com/saas-sentry/reviews --send
+```
+
+Set `SAAS_SENTRY_REVIEW_WEBHOOK_URL` instead of passing `--webhook-url`; optionally set `SAAS_SENTRY_REVIEW_WEBHOOK_TOKEN` for bearer authentication. Each owner receives one JSON payload containing that owner's reminders. The delivery ledger records per-finding success or failure, skips successful reminders on later runs, and retries failed deliveries. Reminder generation still respects the configured minimum gap; overdue items remain eligible until an owner decides them.
 
 ### Shared pools and prorated contract changes
 

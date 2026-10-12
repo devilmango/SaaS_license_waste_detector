@@ -22,6 +22,7 @@ from .access_reviews import (
     generate_reminders,
     list_campaign_items,
 )
+from .review_notifications import deliver_review_reminders
 from .contract_model import format_contract_model, model_contract_period
 from .connectors import (
     ConnectorError,
@@ -36,6 +37,7 @@ from .entitlements import analyze_entitlements, format_entitlements
 from .import_health import build_import_health, format_import_health
 from .realization import build_realization_report, format_realization_report
 from .verification import format_invoice_verification, verify_invoice_savings
+from .reclaim_verification import format_verifications, verify_provider_reclaims
 from .engine import (
     InputError,
     analyze,
@@ -254,6 +256,16 @@ def build_parser() -> argparse.ArgumentParser:
     action_resolve.add_argument("--resolved-as", choices=("completed", "not-applied"), required=True)
     action_resolve.add_argument("--resolved-by", required=True)
     action_resolve.add_argument("--note", required=True)
+    action_verify_provider = action_commands.add_parser(
+        "verify-provider", help="verify completed reclaims against a fresh provider import",
+    )
+    action_verify_provider.add_argument("--file", type=Path, default=Path("actions.csv"), help="approval action ledger")
+    action_verify_provider.add_argument("--execution-ledger", type=Path, default=Path("execution-events.csv"))
+    action_verify_provider.add_argument("--findings", type=Path, required=True)
+    action_verify_provider.add_argument("--billing", type=Path, required=True, help="billing.csv from the latest complete provider import")
+    action_verify_provider.add_argument("--provider", choices=("microsoft365", "google_workspace", "github_copilot", "slack", "zoom"), required=True)
+    action_verify_provider.add_argument("--verification-ledger", type=Path, default=Path("reclaim-verification-events.csv"))
+    action_verify_provider.add_argument("--output", type=Path, required=True, help="CSV report for this verification run")
     history = subparsers.add_parser("history", help="list or compare saved analysis snapshots")
     history_actions = history.add_subparsers(dest="history_command", required=True)
     history_list = history_actions.add_parser("list", help="list snapshots in a directory")
@@ -336,6 +348,15 @@ def build_parser() -> argparse.ArgumentParser:
     campaign_reminders.add_argument("--within-days", type=_nonnegative, default=7)
     campaign_reminders.add_argument("--minimum-gap-days", type=_nonnegative, default=7)
     campaign_reminders.add_argument("--output", type=Path, required=True)
+    campaign_deliver = review_commands.add_parser(
+        "deliver-reminders", help="preview or send owner-grouped reminders to an HTTPS JSON webhook",
+    )
+    campaign_deliver.add_argument("--reminders", type=Path, required=True, help="CSV produced by access-review reminders")
+    campaign_deliver.add_argument("--ledger", type=Path, default=Path("access-review-deliveries.csv"))
+    campaign_deliver.add_argument(
+        "--webhook-url", default=os.environ.get("SAAS_SENTRY_REVIEW_WEBHOOK_URL", ""),
+    )
+    campaign_deliver.add_argument("--send", action="store_true", help="deliver reminders; default is preview only")
     campaign_decide = review_commands.add_parser("decide", help="record an owner's decision in campaign and review ledgers")
     campaign_decide.add_argument("--ledger", type=Path, default=Path("access-review-events.csv"))
     campaign_decide.add_argument("--reviews", type=Path, default=Path("reviews.csv"))
@@ -383,6 +404,9 @@ def build_parser() -> argparse.ArgumentParser:
     sync.add_argument("--contract-pricing", type=Path)
     sync.add_argument("--config", type=Path)
     sync.add_argument("--review-file", type=Path)
+    sync.add_argument("--action-ledger", type=Path, help="optionally verify completed reclaim actions after every provider import")
+    sync.add_argument("--execution-ledger", type=Path, help="execution ledger paired with --action-ledger")
+    sync.add_argument("--verification-ledger", type=Path, help="append-only reclaim verification ledger; defaults inside --output-dir")
     sync.add_argument("--organization", help="GitHub organization for github-copilot")
     sync.add_argument("--identity-map", type=Path, help="GitHub login-to-HR map for github-copilot")
     sync.add_argument("--customer", default="my_customer", help="Google Workspace customer ID")
@@ -564,6 +588,23 @@ def _actions(args: argparse.Namespace) -> int:
             resolved_as=args.resolved_as.replace("-", "_"), actor=args.resolved_by, note=args.note,
         )
         print(f"Recorded independent {args.resolved_as} reconciliation for action {args.action_id}.")
+        return 0
+    if args.action_command == "verify-provider":
+        protected_outputs = {
+            args.file.resolve(), args.execution_ledger.resolve(), args.findings.resolve(),
+            args.billing.resolve(), args.verification_ledger.resolve(),
+            (args.billing.parent / "import.json").resolve(),
+        }
+        if args.output.resolve() in protected_outputs:
+            raise InputError("provider verification report cannot overwrite an input or verification ledger")
+        records = verify_provider_reclaims(
+            args.file, args.execution_ledger, args.findings, args.billing,
+            args.verification_ledger, provider=args.provider,
+        )
+        _write_text(args.output, format_verifications(records))
+        verified = sum(row.status == "verified_reclaimed" for row in records)
+        follow_up = sum(row.status != "verified_reclaimed" for row in records)
+        print(f"Verified {verified} reclaims from the {args.provider} snapshot; {follow_up} need follow-up. Report: {args.output}")
         return 0
     event = {"approve": "approved", "reject": "rejected", "reclaimed": "reclaimed"}[args.action_command]
     transition_action(
@@ -799,7 +840,20 @@ def _access_review(args: argparse.Namespace) -> int:
             args.ledger, args.output, as_of=args.as_of, within_days=args.within_days,
             minimum_gap_days=args.minimum_gap_days,
         )
-        print(f"Wrote {len(rows)} owner reminders to {args.output}; delivery is operator-managed.")
+        print(f"Wrote {len(rows)} owner reminders to {args.output}.")
+        return 0
+    if args.access_review_command == "deliver-reminders":
+        if not args.webhook_url:
+            raise InputError("provide --webhook-url or set SAAS_SENTRY_REVIEW_WEBHOOK_URL")
+        if args.ledger.resolve() == args.reminders.resolve():
+            raise InputError("reminder delivery ledger cannot overwrite the reminders CSV")
+        pending, delivered, failed = deliver_review_reminders(
+            args.reminders, args.ledger, webhook_url=args.webhook_url, send=args.send,
+        )
+        if args.send:
+            print(f"Delivered {delivered} reminders; {failed} failed and can be retried.")
+            return 1 if failed else 0
+        print(f"Preview: {pending} reminders for owners would be sent. Pass --send to deliver them.")
         return 0
     if args.reviews.resolve() == args.ledger.resolve():
         raise InputError("review decisions and campaign events require separate ledger files")
@@ -884,6 +938,29 @@ def _sync_once(args: argparse.Namespace) -> tuple[int, int]:
         renewals_csv=report_dir / "renewals.csv", snapshot_dir=args.output_dir / "snapshots",
     )
     _analyze(report_args)
+    action_ledger = getattr(args, "action_ledger", None)
+    execution_ledger = getattr(args, "execution_ledger", None)
+    if action_ledger and execution_ledger:
+        provider_names = {
+            "microsoft365": "microsoft365", "google-workspace": "google_workspace",
+            "github-copilot": "github_copilot", "slack": "slack", "zoom": "zoom",
+        }
+        verification_ledger = getattr(args, "verification_ledger", None) or (
+            args.output_dir / "reclaim-verification-events.csv"
+        )
+        verification_output = report_dir / "reclaim-verification.csv"
+        records = verify_provider_reclaims(
+            action_ledger, execution_ledger, None,
+            args.output_dir / "billing.csv", verification_ledger,
+            provider=provider_names[args.provider],
+        )
+        _write_text(verification_output, format_verifications(records))
+        verified = sum(row.status == "verified_reclaimed" for row in records)
+        follow_up = sum(row.status != "verified_reclaimed" for row in records)
+        print(
+            f"Provider reclaim verification: {verified} verified, {follow_up} need follow-up. "
+            f"Report: {verification_output}"
+        )
     return imported
 
 
@@ -896,6 +973,12 @@ def _sync(args: argparse.Namespace) -> int:
             protected.add(path.resolve())
     if args.output_dir.resolve() in protected:
         raise InputError("sync output directory cannot be an input file path")
+    action_ledger = getattr(args, "action_ledger", None)
+    execution_ledger = getattr(args, "execution_ledger", None)
+    if bool(action_ledger) != bool(execution_ledger):
+        raise InputError("--action-ledger and --execution-ledger must be provided together")
+    if getattr(args, "verification_ledger", None) and not action_ledger:
+        raise InputError("--verification-ledger requires --action-ledger and --execution-ledger")
     while True:
         users, assignments = _sync_once(args)
         print(f"Synced {args.provider}: {users} users and {assignments} license assignments.")

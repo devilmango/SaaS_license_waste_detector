@@ -231,7 +231,7 @@ def generate_reminders(
             "application": item.application, "owner": item.owner,
             "due_on": item.due_on.isoformat(), "event": "reminder",
             "actor": "saas-sentry", "occurred_on": today.isoformat(),
-            "note": "Reminder queue generated locally; delivery is operator-managed.",
+            "note": "Reminder queue generated; delivery is tracked in the delivery ledger.",
         })
     return tuple(eligible)
 
