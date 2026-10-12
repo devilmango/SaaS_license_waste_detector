@@ -88,6 +88,18 @@ jobs:
           saas-sentry verify-savings --actions actions.csv --findings findings.csv \
             --baseline-invoice examples/savings-before.csv \
             --current-invoice examples/savings-after.csv --output invoice-verification.csv
+          saas-sentry contract-model --billing examples/billing.csv \
+            --contracts examples/contract-entitlements.csv \
+            --contract-pricing examples/contract-pricing.csv \
+            --changes examples/contract-changes.csv \
+            --period-start 2026-09-01 --period-end 2026-10-01 \
+            --config config.example.toml --output contract-period.csv
+          saas-sentry access-review create --findings findings.csv \
+            --ledger access-review-events.csv --campaign-id ci-review \
+            --due-on 2026-10-20 --created-by ci@example.com \
+            --owner-map examples/application-owners.csv --default-owner finops@example.com
+          saas-sentry access-review reminders --ledger access-review-events.csv \
+            --as-of 2026-10-15 --within-days 7 --output access-review-reminders.csv
 
       - name: Validate provider and action CLI help
         run: |
@@ -105,6 +117,8 @@ jobs:
           saas-sentry realization --help
           saas-sentry verify-savings --help
           saas-sentry sync --help
+          saas-sentry access-review --help
+          saas-sentry contract-model --help
 
       - name: Run scheduled report once
         run: >-

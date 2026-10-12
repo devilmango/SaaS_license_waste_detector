@@ -23,6 +23,8 @@ SaaS Sentry combines HR, usage, contract, and billing data to flag terminated ac
 - Monitor report snapshots for material spend/seat shifts, renewal deadlines, seat-floor exposure, and invoice anomalies.
 - Execute approved Microsoft 365, Google Workspace, Slack, and Zoom license reclaims and GitHub Copilot seat cancellations with preview-by-default and an idempotent audit ledger.
 - Compare assigned licenses with purchased contract entitlements to identify seat overages, unused seats, and missing entitlement records.
+- Run owner-assigned access-review campaigns with due dates, cooldown-aware reminder queues, and decisions linked to the review ledger.
+- Model shared seat pools, volume price tiers, and prorated charges from effective-dated mid-term seat, entitlement, and price changes.
 - Deliver monitor alerts to an HTTPS JSON webhook with preview-by-default and a local deduplication ledger.
 - Report source freshness, identity-match coverage, import quality issues, and provider metadata consistency.
 - Compare realized annual savings with estimates and break results down by owner, app, department, cost center, and month.
@@ -506,6 +508,48 @@ saas-sentry entitlements --billing examples/billing.csv \
 ```
 
 The report includes active and entitled seats, overage seats, unused entitlement seats, and estimated annual overage exposure. It is a reconciliation signal: reconcile contract line items and billing terms with procurement before changing a subscription.
+
+For contracts where multiple applications draw from one purchased seat pool, add an optional `pool_id` column to the entitlement CSV and repeat the same `entitled_seats` value for each application in that pool. Active identities are counted once per pool. Billing rows can include an optional `seat_pool_id` when the application-to-pool mapping is not represented in the entitlement file. Optional `min_seats,max_seats` columns define entitlement tiers by the pool's active seat count; repeat the same tier schedule for every application in a shared pool. `contract-pricing.csv` continues to define the separate price-per-seat tiers.
+
+### Owner access-review campaigns
+
+Create an assignment campaign from unreviewed findings. Existing `review_owner` values are used; an optional `application,owner` CSV maps apps to owners, and `--default-owner` fills any remaining blanks. Decisions are restricted to the assigned owner and are written to both the campaign event ledger and the existing `reviews.csv` ledger, so analysis and reclaim approval continue to use the same review state.
+
+```bash
+saas-sentry access-review create --findings findings.csv \
+  --ledger access-review-events.csv --due-on 2026-11-01 \
+  --created-by finops@example.com --owner-map application-owners.csv \
+  --default-owner app-owner@example.com
+saas-sentry access-review list --ledger access-review-events.csv
+saas-sentry access-review reminders --ledger access-review-events.csv \
+  --as-of 2026-10-25 --within-days 7 --minimum-gap-days 7 \
+  --output owner-reminders.csv
+saas-sentry access-review decide --ledger access-review-events.csv \
+  --reviews reviews.csv --campaign-id <CAMPAIGN_ID> --finding-id <FINDING_ID> \
+  --decision confirmed --reviewed-by app-owner@example.com --note "Still required"
+```
+
+The reminder command writes a local queue for an operator to deliver and records when each queue entry was generated. It does not email owners or post to chat systems. Repeated runs respect the configured minimum gap; overdue items remain in the queue until an owner decides them.
+
+### Shared pools and prorated contract changes
+
+`contract-model` projects charges for an invoice period from active billing assignments, fixed or tiered seat entitlements, the existing `contract-pricing.csv` volume tiers, and a dated change log. Add `pool_id` to entitlement rows to share entitlements across applications. Active identities are deduplicated within each pool. Change events support `seat_add`, `seat_remove`, `entitlement_change`, and `price_change`; seat and entitlement events target a `pool_id` when the contract has multiple pools. Price changes apply contract-wide from their effective date for the rest of the modeled period. Changes outside the selected invoice period are ignored.
+
+```csv
+contract_id,pool_id,effective_date,event_type,seat_delta,entitlement_delta,annual_cost_per_seat,currency
+shared-contract,collaboration,2026-10-15,seat_add,1,,,
+shared-contract,collaboration,2026-10-15,entitlement_change,,1,,
+shared-contract,,2026-10-20,price_change,,,,9500,INR
+```
+
+```bash
+saas-sentry contract-model --billing billing.csv --contracts contract-entitlements.csv \
+  --contract-pricing contract-pricing.csv --changes contract-changes.csv \
+  --period-start 2026-10-01 --period-end 2026-11-01 \
+  --config config.toml --output contract-period.csv
+```
+
+The end date is exclusive. Charges are calculated per effective-date segment using the matching tier's annual per-seat rate, the contractual seat minimum, and a 365-day proration basis. The report shows opening/ending active and entitled seats, ending overage, start/end annualized run rates, and the modeled period charge. This is a planning estimate; reconcile the schedule and proration convention with negotiated contract language and the vendor invoice.
 
 ### Webhook alert delivery
 

@@ -15,6 +15,14 @@ import sys
 import time
 
 from .actions import ActionError, list_actions, propose_action, transition_action
+from .access_reviews import (
+    create_campaign,
+    decide_campaign_item,
+    format_campaign_items,
+    generate_reminders,
+    list_campaign_items,
+)
+from .contract_model import format_contract_model, model_contract_period
 from .connectors import (
     ConnectorError,
     GitHubCopilotConnector,
@@ -305,6 +313,50 @@ def build_parser() -> argparse.ArgumentParser:
     verify_savings.add_argument("--current-invoice", type=Path, required=True, help="normalized FOCUS CSV for later period")
     verify_savings.add_argument("--minimum-realization-percent", type=_money, default=Decimal("80"))
     verify_savings.add_argument("--output", type=Path, required=True)
+
+    access_review = subparsers.add_parser(
+        "access-review", help="assign finding reviews to owners and track due dates and decisions",
+    )
+    review_commands = access_review.add_subparsers(dest="access_review_command", required=True)
+    campaign_create = review_commands.add_parser("create", help="create a campaign from unreviewed findings")
+    campaign_create.add_argument("--findings", type=Path, required=True)
+    campaign_create.add_argument("--ledger", type=Path, default=Path("access-review-events.csv"))
+    campaign_create.add_argument("--due-on", type=date.fromisoformat, required=True)
+    campaign_create.add_argument("--created-by", required=True)
+    campaign_create.add_argument("--default-owner", default="")
+    campaign_create.add_argument("--owner-map", type=Path, help="optional application,owner CSV")
+    campaign_create.add_argument("--campaign-id")
+    campaign_list = review_commands.add_parser("list", help="list campaign assignments and decisions")
+    campaign_list.add_argument("--ledger", type=Path, default=Path("access-review-events.csv"))
+    campaign_list.add_argument("--campaign-id", default="")
+    campaign_list.add_argument("--as-of", type=date.fromisoformat)
+    campaign_reminders = review_commands.add_parser("reminders", help="write and record a local due-item reminder queue")
+    campaign_reminders.add_argument("--ledger", type=Path, default=Path("access-review-events.csv"))
+    campaign_reminders.add_argument("--as-of", type=date.fromisoformat)
+    campaign_reminders.add_argument("--within-days", type=_nonnegative, default=7)
+    campaign_reminders.add_argument("--minimum-gap-days", type=_nonnegative, default=7)
+    campaign_reminders.add_argument("--output", type=Path, required=True)
+    campaign_decide = review_commands.add_parser("decide", help="record an owner's decision in campaign and review ledgers")
+    campaign_decide.add_argument("--ledger", type=Path, default=Path("access-review-events.csv"))
+    campaign_decide.add_argument("--reviews", type=Path, default=Path("reviews.csv"))
+    campaign_decide.add_argument("--campaign-id", required=True)
+    campaign_decide.add_argument("--finding-id", required=True)
+    campaign_decide.add_argument("--decision", choices=("confirmed", "dismissed", "deferred"), required=True)
+    campaign_decide.add_argument("--reviewed-by", required=True)
+    campaign_decide.add_argument("--note", default="")
+    campaign_decide.add_argument("--on", type=date.fromisoformat)
+
+    contract_model = subparsers.add_parser(
+        "contract-model", help="project pooled seat, entitlement, and prorated contract changes",
+    )
+    contract_model.add_argument("--billing", type=Path, required=True)
+    contract_model.add_argument("--contracts", type=Path, required=True, help="entitlements CSV; optional pool_id groups applications")
+    contract_model.add_argument("--contract-pricing", type=Path, required=True)
+    contract_model.add_argument("--changes", type=Path, required=True, help="effective-dated contract changes CSV")
+    contract_model.add_argument("--period-start", type=date.fromisoformat, required=True)
+    contract_model.add_argument("--period-end", type=date.fromisoformat, required=True, help="exclusive period end")
+    contract_model.add_argument("--config", type=Path)
+    contract_model.add_argument("--output", type=Path, required=True)
 
     watch = subparsers.add_parser("watch", help="run recurring reports in the foreground")
     watch.add_argument("--hr", type=Path, required=True)
@@ -726,6 +778,55 @@ def _verify_savings(args: argparse.Namespace) -> int:
     return 0
 
 
+def _access_review(args: argparse.Namespace) -> int:
+    if args.access_review_command == "create":
+        if args.findings.resolve() == args.ledger.resolve():
+            raise InputError("access-review ledger cannot overwrite findings")
+        campaign_id, count = create_campaign(
+            args.findings, args.ledger, due_on=args.due_on, created_by=args.created_by,
+            default_owner=args.default_owner, owner_map_path=args.owner_map,
+            campaign_id=args.campaign_id,
+        )
+        print(f"Created access review campaign {campaign_id} with {count} assignments due {args.due_on}.")
+        return 0
+    if args.access_review_command == "list":
+        sys.stdout.write(format_campaign_items(
+            list_campaign_items(args.ledger, campaign_id=args.campaign_id, as_of=args.as_of),
+        ))
+        return 0
+    if args.access_review_command == "reminders":
+        rows = generate_reminders(
+            args.ledger, args.output, as_of=args.as_of, within_days=args.within_days,
+            minimum_gap_days=args.minimum_gap_days,
+        )
+        print(f"Wrote {len(rows)} owner reminders to {args.output}; delivery is operator-managed.")
+        return 0
+    if args.reviews.resolve() == args.ledger.resolve():
+        raise InputError("review decisions and campaign events require separate ledger files")
+    decide_campaign_item(
+        args.ledger, args.reviews, args.campaign_id, args.finding_id, args.decision,
+        reviewed_by=args.reviewed_by, note=args.note, decided_on=args.on,
+    )
+    print(f"Recorded {args.decision} for {args.finding_id} in campaign {args.campaign_id}.")
+    return 0
+
+
+def _contract_model(args: argparse.Namespace) -> int:
+    inputs = {args.billing.resolve(), args.contracts.resolve(), args.contract_pricing.resolve(), args.changes.resolve()}
+    if args.config:
+        inputs.add(args.config.resolve())
+    if args.output.resolve() in inputs:
+        raise InputError("contract model output cannot overwrite an input file")
+    _, currency = load_config(args.config)
+    rows = model_contract_period(
+        args.billing, args.contracts, args.contract_pricing, args.changes,
+        args.period_start, args.period_end, currency=currency,
+    )
+    _write_text(args.output, format_contract_model(rows))
+    print(f"Modeled {len(rows)} contracts for {args.period_start} through {args.period_end} (exclusive).")
+    return 0
+
+
 def _watch(args: argparse.Namespace) -> int:
     if not math.isfinite(args.every_hours) or args.every_hours <= 0:
         raise InputError("--every-hours must be greater than zero")
@@ -838,6 +939,10 @@ def main() -> int:
             return _realization(args)
         if args.command == "verify-savings":
             return _verify_savings(args)
+        if args.command == "access-review":
+            return _access_review(args)
+        if args.command == "contract-model":
+            return _contract_model(args)
         if args.command == "sync":
             return _sync(args)
         return _watch(args)

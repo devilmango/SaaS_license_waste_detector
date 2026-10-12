@@ -1,0 +1,3 @@
+contract_id,pool_id,effective_date,event_type,seat_delta,entitlement_delta,annual_cost_per_seat,currency
+slack-annual,,2026-09-15,seat_add,1,,,
+slack-annual,,2026-09-15,entitlement_change,,1,,
