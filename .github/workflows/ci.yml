@@ -122,6 +122,15 @@ jobs:
           saas-sentry sync --help
           saas-sentry access-review --help
           saas-sentry access-review deliver-reminders --help
+          saas-sentry ledger migrate --help
+          saas-sentry identity --help
+          saas-sentry identity import-entra --help
+          saas-sentry identity import-scim --help
+          saas-sentry identity reconcile --help
+          saas-sentry contracts --help
+          saas-sentry contracts record --help
+          saas-sentry contracts approve --help
+          saas-sentry contracts reconcile --help
           saas-sentry contract-model --help
 
       - name: Run scheduled report once

@@ -38,6 +38,16 @@ from .import_health import build_import_health, format_import_health
 from .realization import build_realization_report, format_realization_report
 from .verification import format_invoice_verification, verify_invoice_savings
 from .reclaim_verification import format_verifications, verify_provider_reclaims
+from .identity import format_identity_matches, import_entra_identities, import_scim_identities, reconcile_identities
+from .contracts import (
+    approve_contract_version,
+    format_contract_invoice_checks,
+    format_contract_versions,
+    list_contract_versions,
+    record_contract_version,
+    reconcile_contract_invoices,
+)
+from .storage import migrate_csv_ledger
 from .engine import (
     InputError,
     analyze,
@@ -172,6 +182,7 @@ def build_parser() -> argparse.ArgumentParser:
     focus_import.add_argument("--output", type=Path, required=True, help="normalized spend CSV destination")
     focus_import.add_argument("--config", type=Path, help="currency conversion rates and effective date")
     focus_import.add_argument("--cost-center-tag", default="cost_center", help="FOCUS Tags key for cost center")
+    focus_import.add_argument("--contract-id-tag", default="contract_id", help="FOCUS Tags key for contract ID")
 
     reconciliation = subparsers.add_parser("reconcile", help="compare FOCUS actual spend to assigned-license cost")
     reconciliation.add_argument("--hr", type=Path, required=True)
@@ -308,6 +319,62 @@ def build_parser() -> argparse.ArgumentParser:
     import_health.add_argument("--stale-after-days", type=_nonnegative, default=7)
     import_health.add_argument("--as-of", type=date.fromisoformat, help="report date (YYYY-MM-DD)")
     import_health.add_argument("--output", type=Path, required=True)
+
+    identity = subparsers.add_parser("identity", help="import identity directories and reconcile them with HR")
+    identity_commands = identity.add_subparsers(dest="identity_command", required=True)
+    identity_entra = identity_commands.add_parser("import-entra", help="import Entra ID users and assigned SKU access")
+    identity_entra.add_argument("--output", type=Path, required=True, help="canonical identity CSV destination")
+    identity_scim = identity_commands.add_parser("import-scim", help="import SCIM 2.0 users and group memberships")
+    identity_scim.add_argument(
+        "--base-url", default=os.environ.get("SAAS_SENTRY_SCIM_BASE_URL", ""),
+        help="SCIM service root; defaults to SAAS_SENTRY_SCIM_BASE_URL",
+    )
+    identity_scim.add_argument("--output", type=Path, required=True, help="canonical identity CSV destination")
+    identity_reconcile = identity_commands.add_parser("reconcile", help="compare HR status with provider access and provisioning")
+    identity_reconcile.add_argument("--hr", type=Path, required=True)
+    identity_reconcile.add_argument("--identities", type=Path, required=True)
+    identity_reconcile.add_argument("--output", type=Path, required=True)
+
+    contracts = subparsers.add_parser("contracts", help="version contract evidence, approve terms, and reconcile invoices")
+    contract_commands = contracts.add_subparsers(dest="contracts_command", required=True)
+    contract_record = contract_commands.add_parser("record", help="append a versioned contract terms and evidence record")
+    contract_record.add_argument("--ledger", type=Path, default=Path("contract-events.csv"))
+    contract_record.add_argument("--contract-id", required=True)
+    contract_record.add_argument("--vendor", required=True)
+    contract_record.add_argument("--owner", required=True)
+    contract_record.add_argument("--application", action="append", required=True, help="repeat for each covered application")
+    contract_record.add_argument("--effective-date", type=date.fromisoformat, required=True)
+    contract_record.add_argument("--renewal-date", type=date.fromisoformat, required=True)
+    contract_record.add_argument("--notice-days", type=_nonnegative, required=True)
+    contract_record.add_argument("--annual-commitment-inr", type=_money, required=True)
+    contract_record.add_argument("--currency", default="INR", help="source document currency; commitment amount is entered in INR")
+    contract_record.add_argument("--evidence-type", choices=("agreement", "order_form", "quote", "invoice", "amendment"), required=True)
+    contract_record.add_argument("--evidence-ref", required=True, help="path or URL identifying the source document")
+    contract_record.add_argument("--recorded-by", required=True)
+    contract_record.add_argument("--note", default="")
+    contract_record.add_argument("--on", type=date.fromisoformat)
+    contract_approve = contract_commands.add_parser("approve", help="approve the latest pending contract version")
+    contract_approve.add_argument("--ledger", type=Path, default=Path("contract-events.csv"))
+    contract_approve.add_argument("--contract-id", required=True)
+    contract_approve.add_argument("--version", type=_nonnegative)
+    contract_approve.add_argument("--approved-by", required=True)
+    contract_approve.add_argument("--note", default="")
+    contract_approve.add_argument("--on", type=date.fromisoformat)
+    contract_list = contract_commands.add_parser("list", help="list versioned terms, evidence, and approvals")
+    contract_list.add_argument("--ledger", type=Path, default=Path("contract-events.csv"))
+    contract_reconcile = contract_commands.add_parser("reconcile", help="compare approved contract terms with a normalized FOCUS invoice")
+    contract_reconcile.add_argument("--ledger", type=Path, default=Path("contract-events.csv"))
+    contract_reconcile.add_argument("--invoice", type=Path, required=True, help="normalized FOCUS CSV")
+    contract_reconcile.add_argument("--tolerance-percent", type=_money, default=Decimal("5"))
+    contract_reconcile.add_argument("--as-of", type=date.fromisoformat)
+    contract_reconcile.add_argument("--output", type=Path, required=True)
+
+    ledger = subparsers.add_parser("ledger", help="migrate supported CSV event ledgers into SQLite")
+    ledger_commands = ledger.add_subparsers(dest="ledger_command", required=True)
+    ledger_migrate = ledger_commands.add_parser("migrate", help="copy and validate a CSV event log into SQLite")
+    ledger_migrate.add_argument("--kind", choices=("actions", "access-review"), required=True)
+    ledger_migrate.add_argument("--source", type=Path, required=True)
+    ledger_migrate.add_argument("--database", type=Path, required=True, help="shared .db, .sqlite, or .sqlite3 destination")
 
     realization = subparsers.add_parser(
         "realization", help="compare modeled and actual annual savings from reclaim actions",
@@ -622,7 +689,10 @@ def _focus_import(args: argparse.Namespace) -> int:
     if args.config and args.output.resolve() == args.config.resolve():
         raise InputError("FOCUS import output cannot overwrite its configuration")
     _, currency = load_config(args.config)
-    rows = load_focus_spend(args.input, currency=currency, cost_center_tag=args.cost_center_tag)
+    rows = load_focus_spend(
+        args.input, currency=currency, cost_center_tag=args.cost_center_tag,
+        contract_id_tag=args.contract_id_tag,
+    )
     _write_text(args.output, format_focus_spend(rows, currency.rate_date))
     print(f"Normalized {len(rows)} FOCUS spend groups into {args.output}.")
     return 0
@@ -781,6 +851,72 @@ def _import_health(args: argparse.Namespace) -> int:
         f"Wrote import health for {len(rows)} sources "
         f"({statuses['healthy']} healthy, {statuses['issues']} with issues, {statuses['stale']} stale)."
     )
+    return 0
+
+
+def _identity(args: argparse.Namespace) -> int:
+    if args.identity_command == "import-entra":
+        count = import_entra_identities(args.output)
+        print(f"Imported {count} Entra ID identities into {args.output}.")
+        return 0
+    if args.identity_command == "import-scim":
+        if not args.base_url:
+            raise InputError("provide --base-url or set SAAS_SENTRY_SCIM_BASE_URL")
+        count = import_scim_identities(args.base_url, args.output)
+        print(f"Imported {count} SCIM identities into {args.output}.")
+        return 0
+    if args.output.resolve() in {args.hr.resolve(), args.identities.resolve()}:
+        raise InputError("identity reconciliation output cannot overwrite an input")
+    rows = reconcile_identities(args.hr, args.identities)
+    _write_text(args.output, format_identity_matches(rows))
+    findings = sum(row.match_status in {
+        "terminated_with_access", "terminated_active_account", "active_hr_deprovisioned",
+        "identity_conflict", "identity_without_hr",
+    } for row in rows)
+    print(f"Reconciled {len(rows)} identities; {findings} require review. Report: {args.output}")
+    return 0
+
+
+def _contracts(args: argparse.Namespace) -> int:
+    if args.contracts_command == "record":
+        version = record_contract_version(
+            args.ledger, contract_id=args.contract_id, vendor=args.vendor, owner=args.owner,
+            applications=args.application, effective_date=args.effective_date,
+            renewal_date=args.renewal_date, notice_days=args.notice_days,
+            annual_commitment_inr=args.annual_commitment_inr, currency=args.currency,
+            evidence_type=args.evidence_type, evidence_ref=args.evidence_ref,
+            recorded_by=args.recorded_by, note=args.note, recorded_on=args.on,
+        )
+        print(f"Recorded contract {args.contract_id} version {version}; a separate approval is required.")
+        return 0
+    if args.contracts_command == "approve":
+        approve_contract_version(
+            args.ledger, args.contract_id, approved_by=args.approved_by,
+            note=args.note, approved_on=args.on, version=args.version,
+        )
+        version = args.version or max(
+            row.version for row in list_contract_versions(args.ledger)
+            if row.contract_id.casefold() == args.contract_id.casefold() and row.event == "approved"
+        )
+        print(f"Approved contract {args.contract_id} version {version}.")
+        return 0
+    if args.contracts_command == "list":
+        sys.stdout.write(format_contract_versions(list_contract_versions(args.ledger)))
+        return 0
+    if args.output.resolve() in {args.ledger.resolve(), args.invoice.resolve()}:
+        raise InputError("contract invoice report cannot overwrite an input")
+    rows = reconcile_contract_invoices(
+        args.ledger, args.invoice, as_of=args.as_of, tolerance_percent=args.tolerance_percent,
+    )
+    _write_text(args.output, format_contract_invoice_checks(rows))
+    review = sum(row.invoice_status != "within_tolerance" or row.renewal_status == "notice_due" for row in rows)
+    print(f"Reconciled {len(rows)} contract versions; {review} need invoice or renewal review. Report: {args.output}")
+    return 0
+
+
+def _ledger(args: argparse.Namespace) -> int:
+    count = migrate_csv_ledger(args.source, args.database, args.kind)
+    print(f"Migrated {count} {args.kind} events from {args.source} to {args.database}.")
     return 0
 
 
@@ -1018,6 +1154,12 @@ def main() -> int:
             return _entitlements(args)
         if args.command == "import-health":
             return _import_health(args)
+        if args.command == "identity":
+            return _identity(args)
+        if args.command == "contracts":
+            return _contracts(args)
+        if args.command == "ledger":
+            return _ledger(args)
         if args.command == "realization":
             return _realization(args)
         if args.command == "verify-savings":

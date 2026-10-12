@@ -10,6 +10,7 @@ import uuid
 from typing import Iterable
 
 from .engine import InputError, _rows, update_review
+from .storage import append_event as append_sqlite_event, is_sqlite_path, read_events as read_sqlite_events
 
 
 EVENT_FIELDS = [
@@ -39,14 +40,21 @@ class CampaignItem:
 def _load_events(path: Path) -> tuple[list[dict[str, str]], dict[tuple[str, str], dict[str, str]]]:
     if not path.exists():
         return [], {}
-    try:
-        with path.open("r", encoding="utf-8-sig", newline="") as handle:
-            reader = csv.DictReader(handle)
-            if not reader.fieldnames or not set(EVENT_FIELDS).issubset(reader.fieldnames):
-                raise InputError(f"{path}: access-review ledger is missing required columns")
-            events = list(reader)
-    except OSError as exc:
-        raise InputError(f"Cannot read access-review ledger {path}: {exc}") from exc
+    if is_sqlite_path(path):
+        events = read_sqlite_events(path, "access_review_events")
+    else:
+        try:
+            with path.open("r", encoding="utf-8-sig", newline="") as handle:
+                reader = csv.DictReader(handle)
+                if not reader.fieldnames or not set(EVENT_FIELDS).issubset(reader.fieldnames):
+                    raise InputError(f"{path}: access-review ledger is missing required columns")
+                events = list(reader)
+        except OSError as exc:
+            raise InputError(f"Cannot read access-review ledger {path}: {exc}") from exc
+    return _parse_events(path, events)
+
+
+def _parse_events(path: Path, events: list[dict[str, str]]) -> tuple[list[dict[str, str]], dict[tuple[str, str], dict[str, str]]]:
     states: dict[tuple[str, str], dict[str, str]] = {}
     for line, event in enumerate(events, start=2):
         campaign_id, finding_id = event.get("campaign_id", ""), event.get("finding_id", "")
@@ -90,6 +98,24 @@ def _load_events(path: Path) -> tuple[list[dict[str, str]], dict[tuple[str, str]
 
 
 def _append(path: Path, event: dict[str, str]) -> None:
+    if is_sqlite_path(path):
+        def validate(events: list[dict[str, str]]) -> None:
+            _parse_events(path, events)
+            candidate = events[-1]
+            if candidate.get("event") != "assigned":
+                return
+            _, previous = _parse_events(path, events[:-1])
+            if any(
+                finding_id == candidate.get("finding_id") and state.get("status") == "pending"
+                for (_, finding_id), state in previous.items()
+            ):
+                raise InputError("This finding already has a pending access-review assignment")
+
+        append_sqlite_event(
+            path, "access_review_events", EVENT_FIELDS, event,
+            validate=validate,
+        )
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         exists = path.exists()

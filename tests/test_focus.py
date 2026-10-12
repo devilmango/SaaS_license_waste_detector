@@ -57,6 +57,17 @@ class FocusImportTests(unittest.TestCase):
         with self.assertRaisesRegex(InputError, "no INR exchange rate"):
             load_focus_spend(self.path, currency=CurrencyConfig(rates_to_inr={"INR": Decimal("1")}))
 
+    def test_preserves_contract_id_tags_for_contract_invoice_reconciliation(self) -> None:
+        self.write_rows([
+            ["Vendor", "Slack", "10", "INR", "2026-09-01", "2026-10-01", '{"contract_id":"slack-1"}'],
+            ["Vendor", "Slack", "20", "INR", "2026-09-01", "2026-10-01", '{"contract_id":"slack-2"}'],
+        ])
+        rows = load_focus_spend(
+            self.path, currency=CurrencyConfig(rates_to_inr={"INR": Decimal("1")}),
+        )
+        self.assertEqual({row.contract_id for row in rows}, {"slack-1", "slack-2"})
+        self.assertIn("contract_id", format_focus_spend(rows, None).splitlines()[0])
+
 
 if __name__ == "__main__":
     unittest.main()

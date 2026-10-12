@@ -22,6 +22,7 @@ class FocusSpend:
     billing_period_end: date
     billing_currency: str
     billed_cost_inr: Decimal
+    contract_id: str = ""
 
 
 def _focus_date(value: str, path: Path, line: int, field: str) -> date:
@@ -36,6 +37,7 @@ def load_focus_spend(
     *,
     currency: CurrencyConfig,
     cost_center_tag: str = "cost_center",
+    contract_id_tag: str = "contract_id",
 ) -> tuple[FocusSpend, ...]:
     """Aggregate FOCUS charges by provider, service, cost center, period, and currency.
 
@@ -46,7 +48,7 @@ def load_focus_spend(
         "ServiceName", "BilledCost", "BillingCurrency", "BillingPeriodStart", "BillingPeriodEnd",
     }
     rows = _rows(path, required)
-    aggregated: dict[tuple[str, str, str, date, date, str], Decimal] = {}
+    aggregated: dict[tuple[str, str, str, date, date, str, str], Decimal] = {}
     for line, row in enumerate(rows, start=2):
         service = row.get("ServiceName", "").strip()
         if not service:
@@ -72,19 +74,23 @@ def load_focus_spend(
             raise InputError(f"{path}:{line}: FOCUS tag {cost_center_tag!r} must be a scalar value")
         cost_center = str(tag_value).strip() if tag_value is not None else ""
         cost_center = cost_center or "Unassigned"
+        contract_value = tags_value.get(contract_id_tag, "") if contract_id_tag else ""
+        if isinstance(contract_value, (dict, list)):
+            raise InputError(f"{path}:{line}: FOCUS tag {contract_id_tag!r} must be a scalar value")
+        contract_id = str(contract_value).strip() if contract_value is not None else ""
         period_start = _focus_date(row.get("BillingPeriodStart", ""), path, line, "BillingPeriodStart")
         period_end = _focus_date(row.get("BillingPeriodEnd", ""), path, line, "BillingPeriodEnd")
         if period_end <= period_start:
             raise InputError(f"{path}:{line}: FOCUS BillingPeriodEnd must be after BillingPeriodStart")
         provider = row.get("ProviderName", "").strip() or "Unknown provider"
-        key = (provider, service, cost_center, period_start, period_end, billing_currency)
+        key = (provider, service, cost_center, period_start, period_end, billing_currency, contract_id)
         aggregated[key] = aggregated.get(key, Decimal("0")) + billed_cost
     return tuple(
             FocusSpend(
             provider, service, cost_center, start, end, source_currency,
-            currency.convert(amount, source_currency, path, 2),
+            currency.convert(amount, source_currency, path, 2), contract_id,
         )
-        for (provider, service, cost_center, start, end, source_currency), amount
+        for (provider, service, cost_center, start, end, source_currency, contract_id), amount
         in sorted(aggregated.items(), key=lambda item: tuple(str(part).casefold() for part in item[0]))
     )
 
@@ -98,6 +104,7 @@ def format_focus_spend(rows: Iterable[FocusSpend], rate_date: date | None) -> st
     writer.writerow([
         "provider", "application", "cost_center", "billing_period_start", "billing_period_end",
         "billing_currency", "actual_billed_cost_inr", "currency_rate_date",
+        "contract_id",
     ])
     for row in rows:
         writer.writerow([
@@ -105,5 +112,6 @@ def format_focus_spend(rows: Iterable[FocusSpend], rate_date: date | None) -> st
             row.billing_period_start.isoformat(), row.billing_period_end.isoformat(),
             row.billing_currency, f"{row.billed_cost_inr:.2f}",
             rate_date.isoformat() if rate_date else "",
+            row.contract_id,
         ])
     return output.getvalue()

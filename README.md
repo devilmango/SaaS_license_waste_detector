@@ -12,6 +12,7 @@ SaaS Sentry combines HR, usage, contract, and billing data to flag terminated ac
 - Convert costs into INR with explicit, dated exchange rates.
 - Model contract seat minimums, price tiers, renewal dates, notice periods, multi-year commitments, and bundled products.
 - Keep review decisions in a local CSV ledger.
+- Store action and access-review event ledgers in a shared SQLite database with transactional writes, or migrate existing CSV ledgers.
 - Save analysis snapshots and compare findings across runs.
 - Generate CSV, JSON, and standalone HTML reports.
 - Allocate active license spend and modeled savings to departments and cost centers.
@@ -27,6 +28,8 @@ SaaS Sentry combines HR, usage, contract, and billing data to flag terminated ac
 - Model shared seat pools, volume price tiers, and prorated charges from effective-dated mid-term seat, entitlement, and price changes.
 - Deliver monitor alerts to an HTTPS JSON webhook with preview-by-default and a local deduplication ledger.
 - Report source freshness, identity-match coverage, import quality issues, and provider metadata consistency.
+- Import Entra ID and SCIM directory records, including active state and app/group access, then compare provisioning with HR status.
+- Keep versioned contract terms linked to agreement/quote/invoice evidence, require separate approval, and reconcile terms against FOCUS invoices.
 - Compare realized annual savings with estimates and break results down by owner, app, department, cost center, and month.
 - Compare reclaimed-license estimates with actual invoice spend for the matching app and cost center.
 - Import Microsoft 365 directory users, assigned SKUs, and successful sign-in dates through read-only Graph access.
@@ -317,14 +320,14 @@ The scheduler expects input exports to be refreshed separately and can run under
 
 ### FOCUS invoice spend
 
-FOCUS exports represent billed charges and do not necessarily identify individual license holders. Import them as a complementary cost-center/service spend view rather than treating invoice rows as per-seat assignments. The importer uses standard FOCUS fields `ServiceName`, `BilledCost`, `BillingCurrency`, `BillingPeriodStart`, `BillingPeriodEnd`, and optional `ProviderName` and `Tags`. It reads the configured cost-center key from the JSON `Tags` column (default: `cost_center`), converts billed amounts to INR using the configured dated rates, then aggregates duplicates by provider, service, cost center, billing period, and source currency.
+FOCUS exports represent billed charges and do not necessarily identify individual license holders. Import them as a complementary cost-center/service spend view rather than treating invoice rows as per-seat assignments. The importer uses standard FOCUS fields `ServiceName`, `BilledCost`, `BillingCurrency`, `BillingPeriodStart`, `BillingPeriodEnd`, and optional `ProviderName` and `Tags`. It reads cost-center and contract ID keys from the JSON `Tags` column (defaults: `cost_center` and `contract_id`), converts billed amounts to INR using the configured dated rates, then aggregates duplicates by provider, service, cost center, contract ID, billing period, and source currency.
 
 ```bash
 saas-sentry focus import \
   --input focus-billing.csv \
   --output focus-spend.csv \
   --config config.toml \
-  --cost-center-tag cost_center
+  --cost-center-tag cost_center --contract-id-tag contract_id
 ```
 
 The output includes actual billed cost in INR, original billing currency, billing period, and exchange-rate date. It preserves negative adjustments/credits and groups charges with different currencies separately. See the [FOCUS specification](https://focus.finops.org/) for the interoperable cost and usage format.
@@ -400,6 +403,23 @@ saas-sentry actions list --file actions.csv
 
 The action list reports status, owner, proposer, approver, estimated savings, actual savings, and variance. Keep the ledger access-controlled because it contains employee references and approver identities.
 
+### Shared SQLite event ledgers
+
+Action and access-review event ledgers accept `.db`, `.sqlite`, or `.sqlite3` paths. Their events live in separate tables, so the same database file can be passed to both workflows. SQLite transactions serialize concurrent writes and validate a state change against the current event history before appending it. CSV remains supported for simple local workflows.
+
+```bash
+# Use one database for action and campaign events.
+saas-sentry actions propose --findings findings.csv --file saas-sentry.sqlite \
+  --finding-id 0123456789abcdef --owner FinOps --proposed-by analyst@example.com
+saas-sentry access-review create --findings findings.csv --ledger saas-sentry.sqlite \
+  --due-on 2026-11-01 --created-by finops@example.com --default-owner app-owner@example.com
+
+# Migrate an existing, validated CSV event ledger once.
+saas-sentry ledger migrate --kind actions --source actions.csv --database saas-sentry.sqlite
+```
+
+The migration refuses to overwrite an existing table of the same ledger type. Review access to the database file as it contains employee and approver data.
+
 ### Savings realization report
 
 The action ledger records estimated and actual annual savings when a reclaim is completed. Generate a CSV report to compare those amounts, see the realization percentage and variance, track estimated savings still in the proposed/approved pipeline, and group results by owner, application, department, cost center, and completion month:
@@ -426,6 +446,20 @@ saas-sentry import-health --hr examples/hr.csv --usage imports/slack/usage.csv \
 ```
 
 Freshness uses provider `imported_at` for usage/billing when metadata is supplied; otherwise it uses each CSV file's modification date. HR freshness always uses the HR CSV modification date. Identity coverage is the percentage of rows that resolve uniquely through primary email, aliases, or employee ID. The report surfaces missing/unmatched identities, collisions, malformed source values, and duplicate app/user rows as issues; it does not modify source files.
+
+### Identity directory and SCIM reconciliation
+
+Import Entra ID directory users through the existing Microsoft Graph app credentials or pull users from a SCIM 2.0 service. Entra app access is represented by assigned SKU IDs; SCIM access is represented by group memberships. SCIM requests require HTTPS and use `SAAS_SENTRY_SCIM_TOKEN`; set `SAAS_SENTRY_SCIM_BASE_URL` or pass the service root explicitly.
+
+```bash
+saas-sentry identity import-entra --output entra-identities.csv
+saas-sentry identity import-scim --base-url https://id.example.com/scim/v2 \
+  --output scim-identities.csv
+saas-sentry identity reconcile --hr examples/hr.csv --identities scim-identities.csv \
+  --output identity-review.csv
+```
+
+The reconciliation flags terminated employees with active app access, active HR records that are deprovisioned, ambiguous identity matches, and directory users missing from HR. It writes a review report and does not change accounts or access.
 
 ### Monitoring anomalies and contract limits
 
@@ -562,6 +596,28 @@ saas-sentry access-review deliver-reminders --reminders owner-reminders.csv \
 ```
 
 Set `SAAS_SENTRY_REVIEW_WEBHOOK_URL` instead of passing `--webhook-url`; optionally set `SAAS_SENTRY_REVIEW_WEBHOOK_TOKEN` for bearer authentication. Each owner receives one JSON payload containing that owner's reminders. The delivery ledger records per-finding success or failure, skips successful reminders on later runs, and retries failed deliveries. Reminder generation still respects the configured minimum gap; overdue items remain eligible until an owner decides them.
+
+### Versioned contract evidence and renewal checks
+
+Record each agreement, order form, quote, invoice, or amendment as a numbered contract version. Terms include the covered applications, effective and renewal dates, notice period, annual commitment entered in INR, responsible owner, and a reference to the source document. A different operator must approve the latest version before it is considered approved. The ledger is append-only; later terms create a new version.
+
+```bash
+saas-sentry contracts record --ledger contract-events.csv \
+  --contract-id slack-enterprise --vendor "Slack Inc" --owner finops@example.com \
+  --application Slack --effective-date 2026-01-01 --renewal-date 2027-01-01 \
+  --notice-days 60 --annual-commitment-inr 120000 --currency USD \
+  --evidence-type order_form --evidence-ref evidence/slack-order-form.pdf \
+  --recorded-by procurement@example.com
+saas-sentry contracts approve --ledger contract-events.csv \
+  --contract-id slack-enterprise --approved-by finance@example.com --note "Terms reviewed"
+saas-sentry contracts list --ledger contract-events.csv
+saas-sentry focus import --input invoice-focus.csv --output invoice-normalized.csv \
+  --config config.example.toml
+saas-sentry contracts reconcile --ledger contract-events.csv \
+  --invoice invoice-normalized.csv --tolerance-percent 5 --output contract-invoice-check.csv
+```
+
+Invoice checks compare the latest contract version's annual commitment, prorated across the invoice period, with actual normalized FOCUS spend. Pending versions remain marked `pending_approval`. When the FOCUS `Tags` data includes a contract identifier, pass `--contract-id-tag` during import to keep spend distinct even when multiple contracts cover the same service. Without contract tags, application names must map to only one contract. The report includes over/under commitment status, variance, renewal date, notice deadline, and evidence reference. This is a reconciliation signal; review tax, credits, discounts, and the source document before changing a subscription.
 
 ### Shared pools and prorated contract changes
 

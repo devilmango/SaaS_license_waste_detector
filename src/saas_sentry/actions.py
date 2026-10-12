@@ -9,6 +9,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 import uuid
 
+from .storage import append_event as append_sqlite_event, is_sqlite_path, read_events as read_sqlite_events
 
 class ActionError(ValueError):
     """Raised for invalid reclaim-action input or state transitions."""
@@ -56,14 +57,21 @@ def _money(value: str, *, path: Path, line: int) -> Decimal:
 def _load_events(path: Path) -> tuple[list[dict[str, str]], dict[str, dict[str, str]]]:
     if not path.exists():
         return [], {}
-    try:
-        with path.open("r", encoding="utf-8-sig", newline="") as handle:
-            reader = csv.DictReader(handle)
-            if not reader.fieldnames or not set(FIELDS).issubset(reader.fieldnames):
-                raise ActionError(f"{path}: action ledger is missing required columns")
-            events = list(reader)
-    except OSError as exc:
-        raise ActionError(f"Cannot read action ledger {path}: {exc}") from exc
+    if is_sqlite_path(path):
+        events = read_sqlite_events(path, "action_events")
+    else:
+        try:
+            with path.open("r", encoding="utf-8-sig", newline="") as handle:
+                reader = csv.DictReader(handle)
+                if not reader.fieldnames or not set(FIELDS).issubset(reader.fieldnames):
+                    raise ActionError(f"{path}: action ledger is missing required columns")
+                events = list(reader)
+        except OSError as exc:
+            raise ActionError(f"Cannot read action ledger {path}: {exc}") from exc
+    return _parse_events(path, events)
+
+
+def _parse_events(path: Path, events: list[dict[str, str]]) -> tuple[list[dict[str, str]], dict[str, dict[str, str]]]:
     states: dict[str, dict[str, str]] = {}
     for line, event in enumerate(events, start=2):
         action_id, finding_id, name = event.get("action_id", ""), event.get("finding_id", ""), event.get("event", "")
@@ -129,6 +137,25 @@ def list_actions(path: Path) -> tuple[ReclaimAction, ...]:
 
 
 def _append_event(path: Path, values: dict[str, str]) -> None:
+    if is_sqlite_path(path):
+        def validate(events: list[dict[str, str]]) -> None:
+            _parse_events(path, events)
+            candidate = events[-1]
+            if candidate.get("event") != "proposed":
+                return
+            _, previous = _parse_events(path, events[:-1])
+            if any(
+                state.get("finding_id") == candidate.get("finding_id")
+                and state.get("status") != "rejected"
+                for state in previous.values()
+            ):
+                raise ActionError("This finding already has a proposed, approved, or completed reclaim action")
+
+        append_sqlite_event(
+            path, "action_events", FIELDS, values,
+            validate=validate,
+        )
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         exists = path.exists()
