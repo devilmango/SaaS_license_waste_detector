@@ -8,6 +8,15 @@ low_features_used_threshold = 2
 [usage]
 window_days = 30
 
+[policy]
+# Adds a buffer to rules.stale_days before an inactivity finding is raised.
+inactivity_grace_days = 0
+# Applies when HR exports a terminated_on date for the employee.
+termination_grace_days = 0
+# Identities listed here are excluded from reclamation findings.
+protected_emails = []
+protected_employee_ids = []
+
 [currency]
 default_currency = "INR"
 rate_date = "2026-10-01"

@@ -24,6 +24,7 @@ class Person:
     aliases: tuple[str, ...]
     department: str
     cost_center: str
+    terminated_on: date | None = None
 
 
 @dataclass(frozen=True)
@@ -89,6 +90,10 @@ class Rules:
     low_active_day_ratio: Decimal = Decimal("0.10")
     low_features_used_threshold: int = 2
     default_usage_window_days: int = 30
+    inactivity_grace_days: int = 0
+    termination_grace_days: int = 0
+    protected_emails: tuple[str, ...] = ()
+    protected_employee_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -283,6 +288,7 @@ def load_inputs(
             key, row.get("employee", "") or email or employee_id, email,
             status, employee_id, aliases,
             row.get("department", "").strip(), row.get("cost_center", "").strip(),
+            _parse_date(row.get("terminated_on", ""), hr_path, line, "terminated_on"),
         )
         people[key] = person
         for address in sorted({normalized_email, *aliases}):
@@ -429,7 +435,15 @@ def load_config(path: Path | None) -> tuple[Rules, CurrencyConfig]:
         raise InputError(f"Cannot read TOML configuration {path}: {exc}") from exc
     rule_data = data.get("rules", {})
     usage_data = data.get("usage", {})
+    policy_data = data.get("policy", {})
     currency_data = data.get("currency", {})
+    if not all(isinstance(section, dict) for section in (rule_data, usage_data, policy_data, currency_data)):
+        raise InputError(f"{path}: rules, usage, policy, and currency sections must be TOML tables")
+    protected_emails = policy_data.get("protected_emails", [])
+    protected_employee_ids = policy_data.get("protected_employee_ids", [])
+    if (not isinstance(protected_emails, list) or not isinstance(protected_employee_ids, list)
+            or any(not isinstance(item, str) or not item.strip() for item in (*protected_emails, *protected_employee_ids))):
+        raise InputError(f"{path}: policy protected_emails and protected_employee_ids must be arrays of non-empty strings")
     try:
         rules = Rules(
             stale_days=int(rule_data.get("stale_days", 90)),
@@ -438,6 +452,10 @@ def load_config(path: Path | None) -> tuple[Rules, CurrencyConfig]:
             low_active_day_ratio=Decimal(str(rule_data.get("low_active_day_ratio", "0.10"))),
             low_features_used_threshold=int(rule_data.get("low_features_used_threshold", 2)),
             default_usage_window_days=int(usage_data.get("window_days", 30)),
+            inactivity_grace_days=int(policy_data.get("inactivity_grace_days", 0)),
+            termination_grace_days=int(policy_data.get("termination_grace_days", 0)),
+            protected_emails=tuple(normalize_email(item) for item in protected_emails),
+            protected_employee_ids=tuple(_normalize_id(item) for item in protected_employee_ids),
         )
         default_currency = str(currency_data.get("default_currency", "INR")).upper()
         raw_rates = currency_data.get("rates_to_inr", {"INR": 1})
@@ -446,7 +464,8 @@ def load_config(path: Path | None) -> tuple[Rules, CurrencyConfig]:
         rate_date = date.fromisoformat(str(rate_date_raw)) if rate_date_raw else None
     except (ValueError, InvalidOperation, AttributeError) as exc:
         raise InputError(f"Invalid rule or currency setting in {path}: {exc}") from exc
-    if min(rules.stale_days, rules.low_usage_threshold, rules.low_features_used_threshold) < 0:
+    if min(rules.stale_days, rules.low_usage_threshold, rules.low_features_used_threshold,
+           rules.inactivity_grace_days, rules.termination_grace_days) < 0:
         raise InputError(f"{path}: day and usage thresholds must be non-negative")
     if not rules.low_active_day_ratio.is_finite() or not Decimal("0") <= rules.low_active_day_ratio <= Decimal("1"):
         raise InputError(f"{path}: low_active_day_ratio must be between zero and one")
@@ -469,6 +488,7 @@ def analyze(
     as_of: date | None = None,
     rules: Rules | None = None,
     currency: CurrencyConfig | None = None,
+    active_exceptions: set[tuple[str, str, str]] | None = None,
 ) -> Analysis:
     """Apply the configured reclaim, stale-activity, and low-use rules."""
     today = as_of or date.today()
@@ -477,20 +497,51 @@ def analyze(
     candidates: list[tuple[Finding, License]] = []
     issues = list(data.issues)
     active_licenses = [license for license in data.licenses if license.status == "active"]
+    active_exceptions = active_exceptions or set()
     for license in active_licenses:
         person = data.people.get(license.person_key or "")
         if not person:
             continue
+        app_key = " ".join(license.application.casefold().split())
+        person_emails = {normalize_email(person.email), *(normalize_email(alias) for alias in person.aliases)}
+        person_id = _normalize_id(person.employee_id)
+        if (person_id and person_id in rules.protected_employee_ids) or person_emails.intersection(rules.protected_emails):
+            issues.append(DataIssue(
+                "policy", license.source_row, license.email or person.employee_id, "protected_user",
+                "License is excluded from findings by the configured protected-user policy.",
+            ))
+            continue
+        exception_match = any(
+            exception_app == app_key
+            and ((exception_id and exception_email and exception_id == person_id
+                  and exception_email in person_emails)
+                 or (exception_id and not exception_email and exception_id == person_id)
+                 or (exception_email and not exception_id and exception_email in person_emails))
+            for exception_id, exception_email, exception_app in active_exceptions
+        )
+        if exception_match:
+            issues.append(DataIssue(
+                "policy", license.source_row, license.email or person.employee_id, "active_exception",
+                "License is excluded while an approved exception remains active.",
+            ))
+            continue
         activity = data.usage.get((person.key, license.application.casefold()))
         if person.status == "terminated":
+            if (person.terminated_on is not None
+                    and (today - person.terminated_on).days < rules.termination_grace_days):
+                issues.append(DataIssue(
+                    "policy", license.source_row, license.email or person.employee_id, "termination_grace_period",
+                    f"Termination grace period of {rules.termination_grace_days} days is still active.",
+                ))
+                continue
             category, reason = "terminated", "Employee is terminated but the license is active."
             evidence = f"HR status={person.status}; license status={license.status}"
         elif activity is None or activity.last_login is None:
             category, reason = "inactive", "No login activity was recorded; investigate or reclaim."
             evidence = "No matching usage record or last_login is blank."
-        elif (today - activity.last_login).days > rules.stale_days:
+        elif (today - activity.last_login).days > rules.stale_days + rules.inactivity_grace_days:
             category = "inactive"
-            reason = f"Last login was more than {rules.stale_days} days ago."
+            reason = f"Last login was more than {rules.stale_days + rules.inactivity_grace_days} days ago."
             evidence = f"Last login={activity.last_login.isoformat()}"
         elif (
             (activity.active_days is not None

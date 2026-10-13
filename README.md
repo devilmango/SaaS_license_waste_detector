@@ -1,6 +1,6 @@
 # SaaS Sentry
 
-**A local CLI for detecting unused SaaS licenses, reviewing recommendations, and estimating contract-aware savings.**
+**A local CLI and read-only web dashboard for detecting unused SaaS licenses, reviewing recommendations, and estimating contract-aware savings.**
 
 SaaS Sentry combines HR, usage, contract, and billing data to flag terminated accounts, stale logins, expensive low-use licenses, and contract entitlement exposure. It produces transparent findings, data-quality diagnostics, historical comparisons, cost-center showback, anomaly alerts, and reports. Provider imports are read-only. License reclaim execution is a separate, explicitly enabled workflow requiring an approved action.
 
@@ -37,6 +37,8 @@ SaaS Sentry combines HR, usage, contract, and billing data to flag terminated ac
 - Run recurring reports in a foreground scheduler.
 - Schedule recurring provider imports followed by analysis, timestamped reports, and optional reclaim verification.
 - Track proposed license reclaims through a separate-approver gate and compare realized savings with the estimate.
+- Serve a responsive local dashboard and read-only JSON API for portfolio findings and renewals.
+- Protect named users, apply configurable inactivity and termination grace periods, and manage audited, expiring exceptions.
 
 ## Architecture
 
@@ -47,7 +49,9 @@ Billing CSV + price map ┘                                  ├─> Findings / 
                                                            ├─> JSON / HTML report
                                                            ├─> Cost-center showback + renewal calendar
                                                            ├─> Analysis snapshots
-                                                           └─> Review ledger
+                                                           ├─> Review ledger
+                                                           ├─> Local dashboard + read-only JSON API
+                                                           └─> Policy exclusions + approved exceptions
 ```
 
 ## Requirements and installation
@@ -92,7 +96,7 @@ CSV column names are case-sensitive. Extra columns are accepted. Files may be UT
 
 ### HR roster (`--hr`)
 
-Required headers: `employee,status`. Each row needs at least one of `email` or `employee_id`. Status is `active` or `terminated`. Optional `email_aliases` contains semicolon-separated addresses. Optional `department` and `cost_center` assign license spend and savings to an organizational owner; blank values appear as `Unassigned`.
+Required headers: `employee,status`. Each row needs at least one of `email` or `employee_id`. Status is `active` or `terminated`. Optional `email_aliases` contains semicolon-separated addresses. Optional `terminated_on` supplies the termination date used by the configured termination grace period. Optional `department` and `cost_center` assign license spend and savings to an organizational owner; blank values appear as `Unassigned`.
 
 ```csv
 employee,employee_id,email,email_aliases,department,cost_center,status
@@ -670,6 +674,63 @@ saas-sentry renewals approve --ledger renewal-events.csv \
 ```
 
 The exported audit report identifies pending owner decisions, overdue notice deadlines, pending budget approvals, and completed or rejected decisions. Campaign events retain the contract version, owner, dates, decision actors, notes, and evidence references. Creating a campaign is idempotent for a given contract version.
+
+### Local dashboard and read-only API
+
+Start the dashboard against the same HR, usage, billing, policy, and review inputs used by the CLI:
+
+```bash
+saas-sentry dashboard --hr examples/hr.csv --usage examples/usage.csv \
+  --billing examples/billing.csv --contract-pricing examples/contract-pricing.csv \
+  --config config.example.toml --review-file reviews.csv \
+  --exceptions exception-events.csv --host 127.0.0.1 --port 8765
+```
+
+Open `http://127.0.0.1:8765/`. The responsive dashboard shows findings, modeled opportunity, recent activity evidence, cost-center context, review state, and contract renewal dates. The JSON API is read-only:
+
+| Endpoint | Response |
+| --- | --- |
+| `GET /api/report` | Complete report payload used by the UI. |
+| `GET /api/findings?limit=100&offset=0` | Paginated findings; limit is capped at 500. |
+| `GET /api/renewals` | Current renewal calendar. |
+| `GET /api/health` | Analysis date and report schema status. |
+
+The service binds to loopback by default, makes no provider calls, and rejects mutation methods. Keep employee source files and report access under your normal local access controls.
+
+### Policy thresholds and protected users
+
+The `[policy]` section in the TOML config adds configurable grace periods and protected identities. `inactivity_grace_days` extends `rules.stale_days` before a stale-login candidate is raised. `termination_grace_days` delays terminated-account findings when the HR row includes `terminated_on`. `protected_emails` and `protected_employee_ids` exclude matching identities from candidate findings; email aliases are covered too. Exclusions are reported as policy data-quality items so operators can see why an account was omitted.
+
+```toml
+[rules]
+stale_days = 90
+
+[policy]
+inactivity_grace_days = 14
+termination_grace_days = 7
+protected_emails = ["breakglass@example.com"]
+protected_employee_ids = ["SVC-001"]
+```
+
+### Time-limited exceptions
+
+Use an append-only ledger when an individual assignment needs a temporary exception. A requester supplies a reason, expiration date, and evidence reference. A different person must approve it with approval evidence before analysis excludes that employee and application. Expired and revoked exceptions stop applying automatically.
+
+```bash
+saas-sentry exceptions request --ledger exception-events.csv \
+  --employee-id E017 --email engineer@example.com --application Slack \
+  --reason "Migration work requires temporary access" --requested-by owner@example.com \
+  --expires-on 2026-11-15 --evidence-ref tickets/IT-2041
+# The request command prints the new exception ID.
+saas-sentry exceptions approve --ledger exception-events.csv \
+  --exception-id <EXCEPTION_ID> --approved-by security@example.com \
+  --evidence-ref approvals/SEC-991
+saas-sentry analyze --hr hr.csv --usage usage.csv --billing billing.csv \
+  --exceptions exception-events.csv --config config.toml --output-csv findings.csv
+saas-sentry exceptions list --ledger exception-events.csv --output exception-audit.csv
+```
+
+Approval is separate from the request, and exception scope cannot be changed in an approval event. Revoke early with `saas-sentry exceptions revoke`; the ledger retains requester, approver, revoker, evidence references, notes, and event dates for audit.
 
 ### Shared pools and prorated contract changes
 

@@ -132,6 +132,20 @@ jobs:
           saas-sentry renewals list --ledger renewal-events.csv \
             --as-of 2026-10-04 --output renewal-audit.csv
 
+      - name: Validate approved exception policy and dashboard report generation
+        run: |
+          saas-sentry exceptions request --ledger ci-exceptions.csv \
+            --employee-id E003 --email john@company.com --application "Google Workspace" \
+            --reason "Temporary transition coverage" --requested-by hr@example.com \
+            --expires-on 2026-11-01 --evidence-ref tickets/HR-1 --on 2026-10-01
+          exception_id=$(python -c 'import csv; print(next(csv.DictReader(open("ci-exceptions.csv"))) ["exception_id"])')
+          saas-sentry exceptions approve --ledger ci-exceptions.csv \
+            --exception-id "$exception_id" --approved-by security@example.com \
+            --evidence-ref approvals/SEC-1 --on 2026-10-02
+          saas-sentry analyze --hr examples/hr.csv --usage examples/usage.csv \
+            --billing examples/billing.csv --config config.example.toml \
+            --exceptions ci-exceptions.csv --as-of 2026-10-04 --output-csv policy-findings.csv
+
       - name: Validate provider and action CLI help
         run: |
           saas-sentry connect google-workspace --help
@@ -167,6 +181,11 @@ jobs:
           saas-sentry renewals create --help
           saas-sentry renewals decide --help
           saas-sentry renewals approve --help
+          saas-sentry dashboard --help
+          saas-sentry exceptions --help
+          saas-sentry exceptions request --help
+          saas-sentry exceptions approve --help
+          saas-sentry exceptions revoke --help
           saas-sentry contract-model --help
 
       - name: Run scheduled report once

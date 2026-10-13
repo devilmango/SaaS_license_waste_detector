@@ -56,6 +56,15 @@ from .renewals import (
     record_budget_approval,
     record_owner_decision,
 )
+from .policy import (
+    active_exception_keys,
+    approve_exception,
+    format_exceptions,
+    list_exceptions,
+    request_exception,
+    revoke_exception,
+)
+from .dashboard import create_server
 from .storage import migrate_csv_ledger
 from .engine import (
     InputError,
@@ -130,7 +139,8 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument("--usage", type=Path, required=True, help="SaaS usage CSV")
     report.add_argument("--billing", type=Path, required=True, help="license billing CSV")
     report.add_argument("--contract-pricing", type=Path, help="optional per-contract seat pricing tiers CSV")
-    report.add_argument("--config", type=Path, help="TOML rules and dated currency rates")
+    report.add_argument("--config", type=Path, help="TOML rules, policy, and dated currency rates")
+    report.add_argument("--exceptions", type=Path, help="append-only approved exception ledger")
     report.add_argument("--stale-days", type=_nonnegative, help="override configured stale-login days")
     report.add_argument("--cost-threshold", type=_money, help="override annual INR cost threshold")
     report.add_argument("--low-usage-threshold", type=_nonnegative, help="override usage-count threshold")
@@ -438,6 +448,49 @@ def build_parser() -> argparse.ArgumentParser:
     renewal_approve.add_argument("--note", default="")
     renewal_approve.add_argument("--on", type=date.fromisoformat)
 
+    exceptions = subparsers.add_parser("exceptions", help="request, approve, and audit time-limited policy exceptions")
+    exception_commands = exceptions.add_subparsers(dest="exceptions_command", required=True)
+    exception_request = exception_commands.add_parser("request", help="request a temporary exclusion for one user and app")
+    exception_request.add_argument("--ledger", type=Path, default=Path("exception-events.csv"))
+    exception_request.add_argument("--employee-id", default="")
+    exception_request.add_argument("--email", default="")
+    exception_request.add_argument("--application", required=True)
+    exception_request.add_argument("--reason", required=True)
+    exception_request.add_argument("--requested-by", required=True)
+    exception_request.add_argument("--expires-on", type=date.fromisoformat, required=True)
+    exception_request.add_argument("--evidence-ref", required=True)
+    exception_request.add_argument("--note", default="")
+    exception_request.add_argument("--on", type=date.fromisoformat)
+    exception_approve = exception_commands.add_parser("approve", help="approve a pending exception with separate evidence")
+    exception_approve.add_argument("--ledger", type=Path, default=Path("exception-events.csv"))
+    exception_approve.add_argument("--exception-id", required=True)
+    exception_approve.add_argument("--approved-by", required=True)
+    exception_approve.add_argument("--evidence-ref", required=True)
+    exception_approve.add_argument("--note", default="")
+    exception_approve.add_argument("--on", type=date.fromisoformat)
+    exception_revoke = exception_commands.add_parser("revoke", help="revoke an approved exception")
+    exception_revoke.add_argument("--ledger", type=Path, default=Path("exception-events.csv"))
+    exception_revoke.add_argument("--exception-id", required=True)
+    exception_revoke.add_argument("--revoked-by", required=True)
+    exception_revoke.add_argument("--note", default="")
+    exception_revoke.add_argument("--on", type=date.fromisoformat)
+    exception_list = exception_commands.add_parser("list", help="export exception status and expiry")
+    exception_list.add_argument("--ledger", type=Path, default=Path("exception-events.csv"))
+    exception_list.add_argument("--as-of", type=date.fromisoformat)
+    exception_list.add_argument("--output", type=Path)
+
+    dashboard = subparsers.add_parser("dashboard", help="serve a local read-only web dashboard and JSON API")
+    dashboard.add_argument("--hr", type=Path, required=True)
+    dashboard.add_argument("--usage", type=Path, required=True)
+    dashboard.add_argument("--billing", type=Path, required=True)
+    dashboard.add_argument("--contract-pricing", type=Path)
+    dashboard.add_argument("--config", type=Path)
+    dashboard.add_argument("--review-file", type=Path)
+    dashboard.add_argument("--exceptions", type=Path)
+    dashboard.add_argument("--as-of", type=date.fromisoformat)
+    dashboard.add_argument("--host", default="127.0.0.1", help="bind address; defaults to localhost")
+    dashboard.add_argument("--port", type=int, default=8765)
+
     realization = subparsers.add_parser(
         "realization", help="compare modeled and actual annual savings from reclaim actions",
     )
@@ -521,6 +574,7 @@ def build_parser() -> argparse.ArgumentParser:
     watch.add_argument("--low-features-used-threshold", type=_nonnegative)
     watch.add_argument("--usage-window-days", type=_nonnegative)
     watch.add_argument("--review-file", type=Path)
+    watch.add_argument("--exceptions", type=Path)
     watch.add_argument("--output-dir", type=Path, required=True)
     watch.add_argument("--every-hours", type=float, default=24.0)
     watch.add_argument("--once", action="store_true", help="write one scheduled report and exit")
@@ -533,6 +587,7 @@ def build_parser() -> argparse.ArgumentParser:
     sync.add_argument("--contract-pricing", type=Path)
     sync.add_argument("--config", type=Path)
     sync.add_argument("--review-file", type=Path)
+    sync.add_argument("--exceptions", type=Path)
     sync.add_argument("--action-ledger", type=Path, help="optionally verify completed reclaim actions after every provider import")
     sync.add_argument("--execution-ledger", type=Path, help="execution ledger paired with --action-ledger")
     sync.add_argument("--verification-ledger", type=Path, help="append-only reclaim verification ledger; defaults inside --output-dir")
@@ -562,10 +617,14 @@ def _analyze(args: argparse.Namespace) -> int:
         default_usage_window_days=window, contract_pricing_path=args.contract_pricing,
     )
     as_of = args.as_of or date.today()
-    result = analyze(data, as_of=as_of, rules=rules, currency=currency)
+    exceptions_path = getattr(args, "exceptions", None)
+    active_exceptions = active_exception_keys(exceptions_path, as_of=as_of)
+    result = analyze(data, as_of=as_of, rules=rules, currency=currency, active_exceptions=active_exceptions)
     reviews = load_reviews(args.review_file)
     print(format_report(result, reviews))
-    inputs = {path.resolve() for path in (args.hr, args.usage, args.billing, args.contract_pricing, args.config) if path}
+    inputs = {path.resolve() for path in (
+        args.hr, args.usage, args.billing, args.contract_pricing, args.config, exceptions_path,
+    ) if path}
     output_paths = [path for path in (
         args.output_csv, args.quality_csv, args.output_json, args.output_html,
         args.showback_csv, args.renewals_csv,
@@ -578,7 +637,7 @@ def _analyze(args: argparse.Namespace) -> int:
     payload = report_payload(
         result, as_of=as_of,
         source_paths=[
-            path for path in (args.hr, args.usage, args.billing, args.contract_pricing, args.review_file)
+            path for path in (args.hr, args.usage, args.billing, args.contract_pricing, args.review_file, exceptions_path)
             if path and path.exists()
         ],
         config_path=args.config,
@@ -1048,6 +1107,57 @@ def _renewals(args: argparse.Namespace) -> int:
     return 0
 
 
+def _exceptions(args: argparse.Namespace) -> int:
+    if args.exceptions_command == "request":
+        exception_id = request_exception(
+            args.ledger, employee_id=args.employee_id, email=args.email,
+            application=args.application, reason=args.reason, requested_by=args.requested_by,
+            expires_on=args.expires_on, evidence_ref=args.evidence_ref,
+            note=args.note, on=args.on,
+        )
+        print(f"Requested exception {exception_id}; a different approver must approve it before it affects analysis.")
+        return 0
+    if args.exceptions_command == "approve":
+        approve_exception(
+            args.ledger, args.exception_id, approved_by=args.approved_by,
+            evidence_ref=args.evidence_ref, note=args.note, on=args.on,
+        )
+        print(f"Approved exception {args.exception_id} through its configured expiration date.")
+        return 0
+    if args.exceptions_command == "revoke":
+        revoke_exception(args.ledger, args.exception_id, revoked_by=args.revoked_by, note=args.note, on=args.on)
+        print(f"Revoked exception {args.exception_id}.")
+        return 0
+    content = format_exceptions(list_exceptions(args.ledger, as_of=args.as_of))
+    if args.output:
+        if args.output.resolve() == args.ledger.resolve():
+            raise InputError("exception export cannot overwrite its event ledger")
+        _write_text(args.output, content)
+        print(f"Exported exception status to {args.output}.")
+    else:
+        sys.stdout.write(content)
+    return 0
+
+
+def _dashboard(args: argparse.Namespace) -> int:
+    if not 1 <= args.port <= 65535:
+        raise InputError("dashboard port must be between 1 and 65535")
+    options = {
+        "hr": args.hr, "usage": args.usage, "billing": args.billing,
+        "contract_pricing": args.contract_pricing, "config": args.config,
+        "review_file": args.review_file, "exceptions": args.exceptions, "as_of": args.as_of,
+    }
+    server = create_server(args.host, args.port, options)
+    print(f"SaaS Sentry read-only dashboard: http://{args.host}:{server.server_port}/ (Ctrl-C to stop)")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("Dashboard stopped.")
+    finally:
+        server.server_close()
+    return 0
+
+
 def _realization(args: argparse.Namespace) -> int:
     if args.output.resolve() in {args.actions.resolve(), args.findings.resolve()}:
         raise InputError("savings realization output cannot overwrite an input file")
@@ -1196,7 +1306,7 @@ def _sync_once(args: argparse.Namespace) -> tuple[int, int]:
         contract_pricing=args.contract_pricing, config=args.config, stale_days=None,
         cost_threshold=None, low_usage_threshold=None, low_active_day_ratio=None,
         low_features_used_threshold=None, usage_window_days=None, as_of=None,
-        review_file=args.review_file, output_csv=report_dir / "findings.csv",
+        review_file=args.review_file, exceptions=getattr(args, "exceptions", None), output_csv=report_dir / "findings.csv",
         quality_csv=report_dir / "quality.csv", output_json=report_dir / "report.json",
         output_html=report_dir / "report.html", showback_csv=report_dir / "showback.csv",
         renewals_csv=report_dir / "renewals.csv", snapshot_dir=args.output_dir / "snapshots",
@@ -1232,7 +1342,7 @@ def _sync(args: argparse.Namespace) -> int:
     if not math.isfinite(args.every_hours) or args.every_hours <= 0:
         raise InputError("--every-hours must be greater than zero")
     protected = {args.hr.resolve(), args.pricing.resolve()}
-    for path in (args.contract_pricing, args.config, args.review_file, args.identity_map):
+    for path in (args.contract_pricing, args.config, args.review_file, args.exceptions, args.identity_map):
         if path:
             protected.add(path.resolve())
     if args.output_dir.resolve() in protected:
@@ -1294,6 +1404,10 @@ def main() -> int:
             return _procurement(args)
         if args.command == "renewals":
             return _renewals(args)
+        if args.command == "exceptions":
+            return _exceptions(args)
+        if args.command == "dashboard":
+            return _dashboard(args)
         if args.command == "realization":
             return _realization(args)
         if args.command == "verify-savings":
