@@ -31,6 +31,7 @@ from .connectors import (
     Microsoft365Connector,
     SlackConnector,
     ZoomConnector,
+    transfer_provider_license,
 )
 from .alerts import deliver_alerts
 from .entitlements import analyze_entitlements, format_entitlements
@@ -49,6 +50,8 @@ from .contracts import (
 )
 from .procurement import format_procurement, normalize_procurement_csv
 from .reassignment import format_reassignments, plan_reassignments
+from .reassignment_workflow import list_states, stage_plan, transition as transition_reassignment
+from .transfers import build_transfer_plan, execute_transfer, verify_transfer_snapshot
 from .renewals import (
     create_renewal_campaign,
     format_renewals,
@@ -64,7 +67,7 @@ from .policy import (
     request_exception,
     revoke_exception,
 )
-from .dashboard import create_server
+from .dashboard import create_server, load_dashboard_users
 from .storage import migrate_csv_ledger
 from .engine import (
     InputError,
@@ -406,6 +409,37 @@ def build_parser() -> argparse.ArgumentParser:
     reassign.add_argument("--demand", type=Path, required=True, help="CSV of active employees requesting a license")
     reassign.add_argument("--output", type=Path, required=True)
 
+    reassignment = subparsers.add_parser("reassignment", help="stage, approve, and record seat transfer execution")
+    reassignment_commands = reassignment.add_subparsers(dest="reassignment_command", required=True)
+    reassignment_stage = reassignment_commands.add_parser("stage", help="stage proposed transfers from a plan")
+    reassignment_stage.add_argument("--plan", type=Path, required=True)
+    reassignment_stage.add_argument("--ledger", type=Path, default=Path("reassignment-events.csv"))
+    reassignment_stage.add_argument("--staged-by", required=True)
+    reassignment_stage.add_argument("--on", type=date.fromisoformat)
+    for transition_name in ("approve", "reject", "complete"):
+        reassignment_event = reassignment_commands.add_parser(transition_name, help=f"{transition_name} a staged seat transfer")
+        reassignment_event.add_argument("--ledger", type=Path, default=Path("reassignment-events.csv"))
+        reassignment_event.add_argument("--finding-id", required=True)
+        reassignment_event.add_argument("--actor", required=True)
+        reassignment_event.add_argument("--evidence-ref", required=True)
+        reassignment_event.add_argument("--note", default="")
+        reassignment_event.add_argument("--on", type=date.fromisoformat)
+    reassignment_list = reassignment_commands.add_parser("list", help="show current transfer states")
+    reassignment_list.add_argument("--ledger", type=Path, default=Path("reassignment-events.csv"))
+    reassignment_execute = reassignment_commands.add_parser("execute", help="preview or execute an approved provider-backed seat transfer")
+    reassignment_execute.add_argument("--ledger", type=Path, default=Path("reassignment-events.csv"))
+    reassignment_execute.add_argument("--billing", type=Path, required=True)
+    reassignment_execute.add_argument("--transfer-ledger", type=Path, default=Path("transfer-events.csv"))
+    reassignment_execute.add_argument("--finding-id", required=True)
+    reassignment_execute.add_argument("--provider", choices=("microsoft365", "google_workspace", "github_copilot", "slack", "zoom"), required=True)
+    reassignment_execute.add_argument("--actor", required=True, help="executor; must differ from the approver")
+    reassignment_execute.add_argument("--identity-map", type=Path, help="CSV mapping email,login for GitHub Copilot target resolution")
+    reassignment_execute.add_argument("--execute", action="store_true", help="perform the provider API transfer; otherwise preview only")
+    reassignment_verify = reassignment_commands.add_parser("verify", help="verify completed operations against a fresh complete provider import")
+    reassignment_verify.add_argument("--transfer-ledger", type=Path, default=Path("transfer-events.csv"))
+    reassignment_verify.add_argument("--billing", type=Path, required=True)
+    reassignment_verify.add_argument("--provider", choices=("microsoft365", "google_workspace", "github_copilot", "slack", "zoom"), required=True)
+
     procurement = subparsers.add_parser(
         "procurement", help="normalize invoice exports from procurement and AP tools",
     )
@@ -479,17 +513,19 @@ def build_parser() -> argparse.ArgumentParser:
     exception_list.add_argument("--as-of", type=date.fromisoformat)
     exception_list.add_argument("--output", type=Path)
 
-    dashboard = subparsers.add_parser("dashboard", help="serve a local read-only web dashboard and JSON API")
+    dashboard = subparsers.add_parser("dashboard", help="serve the authenticated portfolio dashboard and review API")
     dashboard.add_argument("--hr", type=Path, required=True)
     dashboard.add_argument("--usage", type=Path, required=True)
     dashboard.add_argument("--billing", type=Path, required=True)
     dashboard.add_argument("--contract-pricing", type=Path)
     dashboard.add_argument("--config", type=Path)
     dashboard.add_argument("--review-file", type=Path)
+    dashboard.add_argument("--campaign-ledger", type=Path, help="append-only access review campaign ledger for dashboard campaigns")
     dashboard.add_argument("--exceptions", type=Path)
     dashboard.add_argument("--as-of", type=date.fromisoformat)
     dashboard.add_argument("--host", default="127.0.0.1", help="bind address; defaults to localhost")
     dashboard.add_argument("--port", type=int, default=8765)
+    dashboard.add_argument("--users-env", default="SAAS_SENTRY_DASHBOARD_USERS", help="environment variable containing JSON actor/role/token entries")
 
     realization = subparsers.add_parser(
         "realization", help="compare modeled and actual annual savings from reclaim actions",
@@ -577,6 +613,8 @@ def build_parser() -> argparse.ArgumentParser:
     watch.add_argument("--exceptions", type=Path)
     watch.add_argument("--output-dir", type=Path, required=True)
     watch.add_argument("--every-hours", type=float, default=24.0)
+    watch.add_argument("--alerts-webhook-url", default=os.environ.get("SAAS_SENTRY_WEBHOOK_URL", ""), help="optional HTTPS webhook for detected report changes")
+    watch.add_argument("--send-alerts", action="store_true", help="deliver alerts; default is preview only")
     watch.add_argument("--once", action="store_true", help="write one scheduled report and exit")
 
     sync = subparsers.add_parser("sync", help="import a provider on a schedule and analyze each refreshed export")
@@ -1056,6 +1094,67 @@ def _reassign(args: argparse.Namespace) -> int:
     return 0
 
 
+def _reassignment_workflow(args: argparse.Namespace) -> int:
+    if args.reassignment_command == "stage":
+        count = stage_plan(args.plan, args.ledger, actor=args.staged_by, on=args.on)
+        print(f"Staged {count} proposed transfers in {args.ledger}; no provider accounts were changed.")
+        return 0
+    if args.reassignment_command == "list":
+        writer = csv.DictWriter(sys.stdout, fieldnames=["finding_id", "application", "contract_id", "from_email", "to_email", "status", "actor", "on", "evidence_ref", "note"])
+        writer.writeheader()
+        writer.writerows(list_states(args.ledger))
+        return 0
+    if args.reassignment_command == "execute":
+        plan = build_transfer_plan(args.ledger, args.billing, args.finding_id, provider=args.provider)
+        target_user_id = ""
+        if args.provider == "github_copilot":
+            if args.identity_map is None:
+                raise InputError("GitHub Copilot transfer requires --identity-map with email,login columns")
+            with args.identity_map.open("r", encoding="utf-8-sig", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+            matches = [row for row in rows if row.get("email", "").casefold() == plan.target_email.casefold()]
+            if len(matches) != 1 or not matches[0].get("login", "").strip():
+                raise InputError("Identity map must resolve the target email to exactly one GitHub login")
+            target_user_id = matches[0]["login"].strip()
+        print(json.dumps({
+            "mode": "execute" if args.execute else "preview", "finding_id": plan.finding_id,
+            "provider": plan.provider, "application": plan.application, "contract_id": plan.contract_id,
+            "source_email": plan.source_email, "target_email": plan.target_email,
+            "target_provider_user_id": target_user_id,
+            "license_id": plan.license_id, "idempotency_key": plan.idempotency_key,
+        }, indent=2))
+        if not args.execute:
+            print("Preview only. Re-run with --execute to call the provider API.")
+            return 0
+        state = next(item for item in list_states(args.ledger) if item["finding_id"] == args.finding_id)
+        if state.get("actor", "").casefold() == args.actor.casefold():
+            raise InputError("Transfer executor must differ from the approver")
+        result = execute_transfer(
+            plan, args.transfer_ledger, actor=args.actor,
+            operation=lambda item: transfer_provider_license(
+                item.provider, item.source_user_id, item.target_email, item.license_id,
+                target_user_id=target_user_id,
+            ),
+        )
+        transition_reassignment(args.ledger, args.finding_id, "completed", actor=args.actor,
+                                evidence_ref=f"provider-transfer:{plan.idempotency_key}")
+        print(f"Provider transfer requested and recorded: {result}. Import a fresh provider snapshot, then run reassignment verify.")
+        return 0
+    if args.reassignment_command == "verify":
+        records = verify_transfer_snapshot(args.transfer_ledger, args.billing, provider=args.provider)
+        for item in records:
+            print(json.dumps(item.__dict__ | {"imported_at": item.imported_at}, default=str))
+        print(f"Verified {len(records)} transfer record(s) against {args.billing}.")
+        return 0
+    target_state = {"approve": "approved", "reject": "rejected", "complete": "completed"}[args.reassignment_command]
+    transition_reassignment(
+        args.ledger, args.finding_id, target_state,
+        actor=args.actor, evidence_ref=args.evidence_ref, note=args.note, on=args.on,
+    )
+    print(f"Recorded {target_state} transfer state for {args.finding_id}.")
+    return 0
+
+
 def _procurement(args: argparse.Namespace) -> int:
     if args.output.resolve() in {args.input.resolve(), args.config.resolve() if args.config else None}:
         raise InputError("normalized procurement output cannot overwrite an input")
@@ -1146,9 +1245,12 @@ def _dashboard(args: argparse.Namespace) -> int:
         "hr": args.hr, "usage": args.usage, "billing": args.billing,
         "contract_pricing": args.contract_pricing, "config": args.config,
         "review_file": args.review_file, "exceptions": args.exceptions, "as_of": args.as_of,
+        "campaign_ledger": args.campaign_ledger,
     }
-    server = create_server(args.host, args.port, options)
-    print(f"SaaS Sentry read-only dashboard: http://{args.host}:{server.server_port}/ (Ctrl-C to stop)")
+    users = load_dashboard_users(args.users_env)
+    server = create_server(args.host, args.port, options, users=users)
+    access_mode = "authenticated" if users or os.environ.get("SAAS_SENTRY_SSO_MODE") else "loopback read-only"
+    print(f"SaaS Sentry {access_mode} dashboard: http://{args.host}:{server.server_port}/ (Ctrl-C to stop)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -1270,6 +1372,18 @@ def _watch(args: argparse.Namespace) -> int:
         args.snapshot_dir = args.output_dir / "snapshots"
         args.as_of = None
         _analyze(args)
+        if args.alerts_webhook_url:
+            snapshots = list_snapshots(args.snapshot_dir)
+            current = snapshots[-1][1] if snapshots else None
+            baseline = snapshots[-2][1] if len(snapshots) > 1 else None
+            anomalies = detect_anomalies(current, baseline=baseline) if current else ()
+            alerts_path = args.output_dir / f"alerts-{stamp}.csv"
+            _write_text(alerts_path, format_anomalies(anomalies))
+            pending, delivered = deliver_alerts(
+                alerts_path, args.output_dir / "alert-deliveries.csv",
+                webhook_url=args.alerts_webhook_url, send=args.send_alerts,
+            )
+            print(f"Scheduled alert delivery: {delivered} sent; {pending - delivered} pending or already delivered.")
         if args.once:
             return 0
         print(f"Next scheduled analysis in {args.every_hours:g} hours. Stop with Ctrl-C.")
@@ -1400,6 +1514,8 @@ def main() -> int:
             return _ledger(args)
         if args.command == "reassign":
             return _reassign(args)
+        if args.command == "reassignment":
+            return _reassignment_workflow(args)
         if args.command == "procurement":
             return _procurement(args)
         if args.command == "renewals":

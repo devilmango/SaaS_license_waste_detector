@@ -112,6 +112,15 @@ jobs:
             --billing examples/billing.csv --findings examples/reassignment-findings.csv \
             --demand examples/license-demand.csv --config config.example.toml \
             --output reassignment-plan.csv
+          saas-sentry reassignment stage --plan reassignment-plan.csv \
+            --ledger reassignment-events.csv --staged-by finops@example.com --on 2026-10-04
+          saas-sentry reassignment approve --ledger reassignment-events.csv \
+            --finding-id demo-terminated-workspace --actor owner@example.com \
+            --evidence-ref approvals/TRANSFER-1 --on 2026-10-04
+          saas-sentry reassignment complete --ledger reassignment-events.csv \
+            --finding-id demo-terminated-workspace --actor it@example.com \
+            --evidence-ref tickets/TRANSFER-1 --on 2026-10-04
+          saas-sentry reassignment list --ledger reassignment-events.csv
           saas-sentry contracts record --ledger renewal-contracts.csv \
             --contract-id ci-slack --vendor "Slack Inc" --owner finops@example.com \
             --application Slack --effective-date 2026-01-01 --renewal-date 2026-11-15 \
@@ -182,6 +191,10 @@ jobs:
           saas-sentry renewals decide --help
           saas-sentry renewals approve --help
           saas-sentry dashboard --help
+          saas-sentry reassignment --help
+          saas-sentry reassignment stage --help
+          saas-sentry reassignment execute --help
+          saas-sentry reassignment verify --help
           saas-sentry exceptions --help
           saas-sentry exceptions request --help
           saas-sentry exceptions approve --help
@@ -197,4 +210,5 @@ jobs:
           --contract-pricing examples/contract-pricing.csv
           --config config.example.toml
           --output-dir scheduled-reports
+          --alerts-webhook-url https://example.invalid/webhook
           --once

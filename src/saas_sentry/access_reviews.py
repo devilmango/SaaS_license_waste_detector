@@ -136,6 +136,7 @@ def create_campaign(
     created_by: str,
     default_owner: str = "",
     owner_map_path: Path | None = None,
+    owner_overrides: dict[str, str] | None = None,
     campaign_id: str | None = None,
     created_on: date | None = None,
 ) -> tuple[str, int]:
@@ -168,6 +169,8 @@ def create_campaign(
                for (_, existing_id), state in states.items()):
             continue
         owner = (
+            (owner_overrides or {}).get(finding_id, "").strip()
+            or
             owners_by_app.get(_norm(row.get("application", "")), "")
             or row.get("review_owner", "").strip()
             or default_owner.strip()

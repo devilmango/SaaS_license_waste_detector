@@ -1,0 +1,40 @@
+services:
+  dashboard:
+    build: .
+    command:
+      - dashboard
+      - --hr
+      - /data/hr.csv
+      - --usage
+      - /data/usage.csv
+      - --billing
+      - /data/billing.csv
+      - --config
+      - /config/config.toml
+      - --review-file
+      - /state/reviews.csv
+      - --exceptions
+      - /state/exception-events.csv
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8765"
+    environment:
+      SAAS_SENTRY_DASHBOARD_USERS: ${SAAS_SENTRY_DASHBOARD_USERS:?Set dashboard users as a JSON array of actor, role, and token records}
+    ports:
+      - "127.0.0.1:${SAAS_SENTRY_PORT:-8765}:8765"
+    volumes:
+      - ./data:/data:ro
+      - ./config:/config:ro
+      - sentry_state:/state
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+
+volumes:
+  sentry_state:

@@ -940,3 +940,178 @@ class ZoomConnector:
             body=json.dumps({"type": 1}).encode("utf-8"),
         )
         return "license_changed_to_basic"
+
+
+def transfer_provider_license(
+    provider: str, source_user_id: str, target_email: str, license_id: str, *,
+    target_user_id: str = "",
+) -> str:
+    """Move an approved paid seat between provider users and verify both live assignments.
+
+    Target activation happens before source release where the provider supports it, so
+    a failed activation leaves the original user licensed. A partial move raises an
+    error and is never retried automatically; the transfer ledger records the outcome.
+    """
+    provider = provider.casefold()
+    target_email = target_email.strip()
+    if not source_user_id.strip() or not target_email:
+        raise ConnectorError("Transfer requires the imported source user and target email")
+    if provider == "microsoft365":
+        connector = Microsoft365Connector.from_environment()
+        try:
+            source_id, sku_id = str(uuid.UUID(source_user_id)), str(uuid.UUID(license_id))
+        except ValueError as exc:
+            raise ConnectorError("Microsoft 365 transfer requires source and SKU UUIDs") from exc
+        token = connector._token()
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        def graph_user(key: str) -> dict:
+            url = f"{GRAPH_ROOT}/users/{quote(key, safe='')}?{urlencode({'$select':'id,mail,userPrincipalName,accountEnabled,assignedLicenses,licenseAssignmentStates'})}"
+            return connector._json_request(Request(url, headers=headers))
+        source, target = graph_user(source_id), graph_user(target_email)
+        if str(source.get("id", "")).casefold() != source_id.casefold():
+            raise ConnectorError("Microsoft 365 source identity changed")
+        target_id = str(target.get("id", ""))
+        if target.get("accountEnabled") is not True:
+            raise ConnectorError("Microsoft 365 target account is disabled")
+        if not target_id or str(target.get("userPrincipalName", target_email)).casefold() != target_email.casefold() and str(target.get("mail", "")).casefold() != target_email.casefold():
+            raise ConnectorError("Microsoft 365 target email did not resolve to the requested user")
+        def assigned(user: dict) -> bool:
+            return any(str(item.get("skuId", "")).casefold() == sku_id.casefold()
+                       for item in user.get("assignedLicenses", []) if isinstance(item, dict))
+        if not assigned(source):
+            raise ConnectorError("Microsoft 365 source no longer has the approved SKU")
+        source_states = [state for state in source.get("licenseAssignmentStates", []) if isinstance(state, dict) and str(state.get("skuId", "")).casefold() == sku_id.casefold()]
+        if not source_states or any(state.get("assignedByGroup") for state in source_states) or not any(str(state.get("state", "")).casefold() == "active" for state in source_states):
+            raise ConnectorError("Microsoft 365 source SKU is missing, inactive, or group-assigned")
+        if assigned(target):
+            raise ConnectorError("Microsoft 365 target already has the SKU")
+        connector._json_request(Request(f"{GRAPH_ROOT}/users/{quote(target_id, safe='')}/assignLicense", data=json.dumps({"addLicenses":[{"skuId":sku_id,"disabledPlans":[]}],"removeLicenses":[]}).encode(), headers={**headers,"Content-Type":"application/json"}, method="POST"))
+        connector._json_request(Request(f"{GRAPH_ROOT}/users/{quote(source_id, safe='')}/assignLicense", data=json.dumps({"addLicenses":[],"removeLicenses":[sku_id]}).encode(), headers={**headers,"Content-Type":"application/json"}, method="POST"))
+        if not assigned(graph_user(target_id)) or assigned(graph_user(source_id)):
+            raise ConnectorError("Microsoft 365 live assignment verification failed")
+        return target_id
+    if provider == "google_workspace":
+        connector = GoogleWorkspaceConnector.from_environment()
+        try:
+            product, sku = json.loads(license_id)
+        except (TypeError, ValueError) as exc:
+            raise ConnectorError("Google Workspace transfer SKU must contain product and SKU IDs") from exc
+        path = "/".join(quote(value, safe="") for value in (product, "sku", sku, "user"))
+        target_dir = _bearer_json(f"https://admin.googleapis.com/admin/directory/v1/users/{quote(target_email, safe='')}", connector.access_token, "Google Workspace", connector.HOSTS)
+        target_key = str(target_dir.get("primaryEmail", ""))
+        if target_key.casefold() != target_email.casefold() or target_dir.get("suspended"):
+            raise ConnectorError("Google Workspace target email did not resolve exactly")
+        target_base = f"https://licensing.googleapis.com/apps/licensing/v1/product/{path}"
+        target_url = f"{target_base}/{quote(target_key, safe='')}"
+        source_url = f"https://licensing.googleapis.com/apps/licensing/v1/product/{path}/{quote(source_user_id, safe='')}"
+        source_assignment = _bearer_json(source_url, connector.access_token, "Google Workspace", connector.HOSTS)
+        if (str(source_assignment.get("userId", "")).casefold() != source_user_id.casefold()
+                or str(source_assignment.get("productId", "")).casefold() != str(product).casefold()
+                or str(source_assignment.get("skuId", "")).casefold() != str(sku).casefold()):
+            raise ConnectorError("Google Workspace source assignment no longer matches the approved transfer")
+        try:
+            current = _bearer_json(target_url, connector.access_token, "Google Workspace", connector.HOSTS)
+        except ConnectorError as exc:
+            if "HTTP 404" not in str(exc):
+                raise
+        else:
+            if current.get("userId"):
+                raise ConnectorError("Google Workspace target already has this license")
+        _bearer_mutation(target_base, connector.access_token, "Google Workspace", connector.HOSTS,
+                         method="POST", body=json.dumps({"userId":target_key}).encode())
+        _bearer_mutation(source_url, connector.access_token, "Google Workspace", connector.HOSTS, method="DELETE")
+        verified = _bearer_json(target_url, connector.access_token, "Google Workspace", connector.HOSTS)
+        if str(verified.get("userId", "")).casefold() != target_key.casefold():
+            raise ConnectorError("Google Workspace target assignment verification failed")
+        return target_key
+    if provider == "github_copilot":
+        if not target_user_id.strip():
+            raise ConnectorError("GitHub Copilot transfer requires --identity-map to resolve the target email to a login")
+        connector = GitHubCopilotConnector.from_environment()
+        organization, source_login = license_id, source_user_id
+        base = f"https://api.github.com/orgs/{quote(organization, safe='')}/copilot/billing/selected_users"
+        headers = {"Accept":"application/vnd.github+json", "X-GitHub-Api-Version":"2022-11-28"}
+        seats: list[dict] = []
+        for page in range(1, 10001):
+            seats_url = f"https://api.github.com/orgs/{quote(organization, safe='')}/copilot/billing/seats?{urlencode({'per_page':100,'page':page})}"
+            values = _bearer_json(seats_url, connector.access_token, "GitHub Copilot", connector.HOSTS, headers=headers).get("seats", [])
+            if not isinstance(values, list):
+                raise ConnectorError("GitHub Copilot response is missing its seats list")
+            seats.extend(value for value in values if isinstance(value, dict))
+            if len(values) < 100:
+                break
+        else:
+            raise ConnectorError("GitHub Copilot transfer pagination exceeded the safety limit")
+        logins = [str((seat.get("assignee") or {}).get("login", "")).casefold() for seat in seats]
+        if source_login.casefold() not in logins:
+            raise ConnectorError("GitHub Copilot source seat no longer exists")
+        if target_user_id.casefold() in logins:
+            raise ConnectorError("GitHub Copilot target already has a seat")
+        _bearer_mutation(base, connector.access_token, "GitHub Copilot", connector.HOSTS, method="POST",
+                         body=json.dumps({"selected_usernames":[target_user_id]}).encode(), headers=headers)
+        _bearer_mutation(base, connector.access_token, "GitHub Copilot", connector.HOSTS, method="DELETE",
+                         body=json.dumps({"selected_usernames":[source_login]}).encode(), headers=headers)
+        current: list[dict] = []
+        for page in range(1, 10001):
+            seats_url = f"https://api.github.com/orgs/{quote(organization, safe='')}/copilot/billing/seats?{urlencode({'per_page':100,'page':page})}"
+            values = _bearer_json(seats_url, connector.access_token, "GitHub Copilot", connector.HOSTS, headers=headers).get("seats", [])
+            if not isinstance(values, list):
+                raise ConnectorError("GitHub Copilot response is missing its seats list")
+            current.extend(value for value in values if isinstance(value, dict))
+            if len(values) < 100:
+                break
+        else:
+            raise ConnectorError("GitHub Copilot verification pagination exceeded the safety limit")
+        final = [str((seat.get("assignee") or {}).get("login", "")).casefold() for seat in current]
+        if target_user_id.casefold() not in final or source_login.casefold() in final:
+            raise ConnectorError("GitHub Copilot live seat verification failed")
+        return target_user_id
+    if provider == "slack":
+        connector = SlackConnector.from_environment()
+        team_id = license_id
+        source_check = _bearer_json(f"https://slack.com/api/users.info?{urlencode({'user':source_user_id})}", connector.access_token, "Slack", connector.HOSTS)
+        source = source_check.get("user") or {}
+        if not source_check.get("ok") or str(source.get("id", "")) != source_user_id or source.get("deleted"):
+            raise ConnectorError("Slack source user is no longer an active member")
+        target = _bearer_json(f"https://slack.com/api/users.lookupByEmail?{urlencode({'email':target_email})}", connector.access_token, "Slack", connector.HOSTS)
+        user = target.get("user") or {}
+        target_id = str(user.get("id", ""))
+        if not target.get("ok") or not target_id or user.get("deleted") or user.get("is_bot"):
+            raise ConnectorError("Slack target must be an active human account")
+        if not (user.get("is_restricted") or user.get("is_ultra_restricted")):
+            raise ConnectorError("Slack target already has a standard member seat")
+        payload = urlencode({"team_id":team_id,"user_id":target_id}).encode()
+        request = Request("https://slack.com/api/admin.users.setRegular", data=payload,
+                          headers={"Authorization":f"Bearer {connector.access_token}","Content-Type":"application/x-www-form-urlencoded"},method="POST")
+        try:
+            with urlopen(request, timeout=30) as response:
+                promoted = json.loads(response.read().decode())
+        except Exception as exc:
+            raise ConnectorError("Slack regular-member promotion failed") from exc
+        if not promoted.get("ok"):
+            raise ConnectorError(f"Slack admin.users.setRegular failed ({promoted.get('error','unknown_error')})")
+        _slack_admin_remove_user(connector.access_token, team_id, source_user_id)
+        check = _bearer_json(f"https://slack.com/api/users.info?{urlencode({'user':target_id})}", connector.access_token, "Slack", connector.HOSTS)
+        if not check.get("ok") or not isinstance(check.get("user"), dict) or check["user"].get("is_restricted"):
+            raise ConnectorError("Slack target promotion verification failed")
+        return target_id
+    if provider == "zoom":
+        connector = ZoomConnector.from_environment()
+        token = connector._token()
+        headers = {"Authorization":f"Bearer {token}","Accept":"application/json"}
+        source_url = f"https://api.zoom.us/v2/users/{quote(source_user_id,safe='')}"
+        source = _bearer_json(source_url, token, "Zoom", connector.HOSTS)
+        target = _bearer_json(f"https://api.zoom.us/v2/users/{quote(target_email,safe='')}", token, "Zoom", connector.HOSTS)
+        if str(source.get("id")) != source_user_id or str(target.get("email", "")).casefold() != target_email.casefold():
+            raise ConnectorError("Zoom source or target identity changed")
+        if str(source.get("status", "active")).casefold() != "active" or str(target.get("status", "active")).casefold() != "active":
+            raise ConnectorError("Zoom source and target accounts must both be active")
+        if int(source.get("type", 0)) != 2 or int(target.get("type", 0)) != 1:
+            raise ConnectorError("Zoom transfer requires a Licensed source and Basic target")
+        target_id = str(target.get("id", ""))
+        _bearer_mutation(f"https://api.zoom.us/v2/users/{quote(target_id,safe='')}", token, "Zoom", connector.HOSTS, method="PATCH", body=b'{"type":2}')
+        _bearer_mutation(source_url, token, "Zoom", connector.HOSTS, method="PATCH", body=b'{"type":1}')
+        if int(_bearer_json(source_url, token, "Zoom", connector.HOSTS).get("type", 0)) != 1 or int(_bearer_json(f"https://api.zoom.us/v2/users/{quote(target_id,safe='')}", token, "Zoom", connector.HOSTS).get("type", 0)) != 2:
+            raise ConnectorError("Zoom live user-type verification failed")
+        return target_id
+    raise ConnectorError(f"Unsupported transfer provider {provider!r}")

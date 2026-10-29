@@ -1,6 +1,6 @@
 # SaaS Sentry
 
-**A local CLI and read-only web dashboard for detecting unused SaaS licenses, reviewing recommendations, and estimating contract-aware savings.**
+**A local CLI and authenticated web dashboard for detecting unused SaaS licenses, reviewing recommendations, and estimating contract-aware savings.**
 
 SaaS Sentry combines HR, usage, contract, and billing data to flag terminated accounts, stale logins, expensive low-use licenses, and contract entitlement exposure. It produces transparent findings, data-quality diagnostics, historical comparisons, cost-center showback, anomaly alerts, and reports. Provider imports are read-only. License reclaim execution is a separate, explicitly enabled workflow requiring an approved action.
 
@@ -38,6 +38,10 @@ SaaS Sentry combines HR, usage, contract, and billing data to flag terminated ac
 - Schedule recurring provider imports followed by analysis, timestamped reports, and optional reclaim verification.
 - Track proposed license reclaims through a separate-approver gate and compare realized savings with the estimate.
 - Serve a responsive local dashboard and read-only JSON API for portfolio findings and renewals.
+- Authenticate dashboard users with viewer, reviewer, and admin bearer-token roles; let reviewers record decisions from the UI.
+- Stage seat-transfer proposals with independent approval, evidence, and completion events.
+- Compare recurring reports and optionally deliver deduplicated HTTPS alerts.
+- Run the dashboard as a non-root container with read-only source mounts, persistent state, and a health check.
 - Protect named users, apply configurable inactivity and termination grace periods, and manage audited, expiring exceptions.
 
 ## Architecture
@@ -309,10 +313,11 @@ saas-sentry history compare --dir snapshots --baseline latest --current 20261004
 ```bash
 saas-sentry watch --hr hr.csv --usage usage.csv --billing billing.csv \
   --contract-pricing contract-pricing.csv --config config.toml \
-  --output-dir reports --every-hours 24
+  --output-dir reports --every-hours 24 \
+  --alerts-webhook-url https://alerts.example.com/saas-sentry
 ```
 
-The scheduler expects input exports to be refreshed separately and can run under a process supervisor or host scheduler.
+The scheduler expects input exports to be refreshed separately and can run under a process supervisor or host scheduler. It compares each snapshot with the preceding run and writes a timestamped anomaly report. Webhook delivery is preview-only unless `--send-alerts` is set; `SAAS_SENTRY_WEBHOOK_TOKEN` supplies an optional bearer token. An alert delivery ledger deduplicates already delivered anomalies.
 
 ### Cost-center showback
 
@@ -640,7 +645,39 @@ saas-sentry reassign --hr hr.csv --usage usage.csv --billing billing.csv \
   --config config.example.toml --output reassignment-plan.csv
 ```
 
-The output includes matched proposals, reclaim supply without a matching request, and requests without a matching confirmed seat. It is a planning report; it does not change provider assignments. Review contract terms and then execute an approved change through the existing action workflow.
+The output includes matched proposals, reclaim supply without a matching request, and requests without a matching confirmed seat. Planning and staging do not change provider assignments. Stage proposals into an append-only lifecycle ledger, require a different person to approve, then execute the provider transfer from the approved plan or record an externally completed transfer with a provider ticket:
+
+```bash
+saas-sentry reassignment stage --plan reassignment-plan.csv \
+  --ledger reassignment-events.csv --staged-by finops@example.com
+saas-sentry reassignment approve --ledger reassignment-events.csv \
+  --finding-id <FINDING_ID> --actor app-owner@example.com \
+  --evidence-ref approvals/TRANSFER-12
+saas-sentry reassignment complete --ledger reassignment-events.csv \
+  --finding-id <FINDING_ID> --actor it@example.com \
+  --evidence-ref tickets/TRANSFER-12
+saas-sentry reassignment list --ledger reassignment-events.csv
+```
+
+After an independent approver records the `approved` state, preview an API transfer. Preview is the default and makes no provider request:
+
+```bash
+saas-sentry reassignment execute --ledger reassignment-events.csv \
+  --billing provider-export/billing.csv --finding-id demo-seat-transfer \
+  --provider microsoft365 --actor it-operator@example.com
+```
+
+To run the approved transfer, add `--execute`. The executor must differ from the approver. Provider credentials use the same environment variables as the read-only connector imports. GitHub Copilot also needs an `email,login` identity map to resolve the target. Results are appended to `transfer-events.csv`; the idempotency key prevents a second API attempt after a success or ambiguous failure. Import the provider again and verify against the complete fresh billing snapshot:
+
+```bash
+saas-sentry reassignment execute --ledger reassignment-events.csv \
+  --billing provider-export/billing.csv --finding-id demo-seat-transfer \
+  --provider microsoft365 --actor it-operator@example.com --execute
+saas-sentry reassignment verify --transfer-ledger transfer-events.csv \
+  --billing fresh-provider-export/billing.csv --provider microsoft365
+```
+
+Transfers activate the target before releasing the source where the provider allows that sequence. A partial or timed-out operation is recorded and will not be retried automatically; reconcile provider state with a fresh import before taking further action. Slack transfers require an Enterprise Grid workspace and a target who is currently a restricted guest eligible for promotion.
 
 ### Procurement and AP invoice imports
 
@@ -675,7 +712,7 @@ saas-sentry renewals approve --ledger renewal-events.csv \
 
 The exported audit report identifies pending owner decisions, overdue notice deadlines, pending budget approvals, and completed or rejected decisions. Campaign events retain the contract version, owner, dates, decision actors, notes, and evidence references. Creating a campaign is idempotent for a given contract version.
 
-### Local dashboard and read-only API
+### Authenticated dashboard and API
 
 Start the dashboard against the same HR, usage, billing, policy, and review inputs used by the CLI:
 
@@ -683,10 +720,75 @@ Start the dashboard against the same HR, usage, billing, policy, and review inpu
 saas-sentry dashboard --hr examples/hr.csv --usage examples/usage.csv \
   --billing examples/billing.csv --contract-pricing examples/contract-pricing.csv \
   --config config.example.toml --review-file reviews.csv \
-  --exceptions exception-events.csv --host 127.0.0.1 --port 8765
+  --exceptions exception-events.csv --campaign-ledger access-review-campaigns.csv \
+  --host 127.0.0.1 --port 8765
 ```
 
-Open `http://127.0.0.1:8765/`. The responsive dashboard shows findings, modeled opportunity, recent activity evidence, cost-center context, review state, and contract renewal dates. The JSON API is read-only:
+Open `http://127.0.0.1:8765/`. The responsive dashboard shows findings, modeled opportunity, recent activity evidence, cost-center context, review state, and contract renewal dates. Loopback remains usable without credentials for read-only access. Configure `SAAS_SENTRY_DASHBOARD_USERS` to require bearer authentication and enable review decisions. Its value is a JSON array, for example:
+
+```bash
+export SAAS_SENTRY_DASHBOARD_USERS='[{"actor":"finops@example.com","role":"reviewer","token":"<at-least-24-random-characters>"},{"actor":"audit@example.com","role":"viewer","token":"<another-random-token>"}]'
+saas-sentry dashboard --hr hr.csv --usage usage.csv --billing billing.csv \
+  --review-file reviews.csv --host 127.0.0.1
+```
+
+The browser keeps the bearer token in session storage. `viewer` can read reports and campaigns; `reviewer` can record decisions and create campaigns; `admin` also has transfer and policy capabilities. A user entry can add app/team scopes and explicit permissions:
+
+```bash
+export SAAS_SENTRY_DASHBOARD_USERS='[{"actor":"owner@example.com","role":"reviewer","token":"<at-least-24-random-characters>","applications":["Slack"],"teams":["Engineering"]}]'
+```
+
+Reports, findings, renewals, campaign visibility, campaign creation, and decisions are filtered or checked against those scopes. `GET /api/session` returns the signed-in actor and CSRF token for cookie sessions. Cookie-authenticated POST requests require `X-CSRF-Token`. Use TLS at a trusted reverse proxy before exposing the dashboard; the built-in HTTP server does not terminate TLS.
+
+#### Dashboard access-review campaigns
+
+The campaign form creates a review for currently unreviewed findings, assigns each row to its selected owner or the campaign's default owner, and sets the due date. The campaign table tracks pending and overdue items and lets the assigned owner record confirmed, dismissed, or deferred decisions. Configure `--campaign-ledger` and `--review-file`; the campaign event log and review file are both updated so the CLI and dashboard share the same status. The API also accepts an `assignments` object mapping finding IDs to individual owners.
+
+#### OIDC or SAML sign-in
+
+Install the project dependencies and choose exactly one provider with `SAAS_SENTRY_SSO_MODE=oidc` or `saml`. OIDC uses Authorization Code with PKCE, state, nonce, discovery metadata, JWKS signature checks, and issuer/audience/expiry validation. SAML uses the `python3-saml` service provider and requires signed-response/issuer/audience/recipient rules in the supplied strict settings file. Map authenticated identities to app/team access with `SAAS_SENTRY_AUTHZ_RULES`, a JSON array of email or group rules:
+
+```bash
+export SAAS_SENTRY_SSO_MODE=oidc
+export SAAS_SENTRY_OIDC_ISSUER=https://idp.example.com/tenant
+export SAAS_SENTRY_OIDC_CLIENT_ID='<client-id>'
+export SAAS_SENTRY_OIDC_CLIENT_SECRET='<secret>'
+export SAAS_SENTRY_OIDC_REDIRECT_URI=https://sentry.example.com/auth/oidc/callback
+export SAAS_SENTRY_AUTHZ_RULES='[{"group":"saas-sentry-reviewers","role":"reviewer","applications":["Slack"],"teams":["Engineering"]}]'
+```
+
+For SAML, set `SAAS_SENTRY_SAML_SETTINGS_FILE` to the service-provider/identity-provider settings JSON and configure the assertion email and group attribute names as `email`/`groups` (or the common aliases `mail`, `emailAddress`, `memberOf`). OIDC login requires the ID token's verified-email claim. Sessions are held server-side, expire after eight hours, use HttpOnly cookies, and require CSRF tokens for mutations. Secure cookies are on by default; `SAAS_SENTRY_COOKIE_SECURE=false` is for local HTTP development only. Bearer users remain supported and can also carry `applications`, `teams`, and `permissions` arrays.
+
+| Endpoint | Response |
+| --- | --- |
+| `GET /api/report` | Complete report payload used by the UI. |
+| `GET /api/findings?limit=100&offset=0` | Paginated findings; limit is capped at 500. |
+| `GET /api/renewals` | Current renewal calendar. |
+| `GET /api/health` | Analysis date and report schema status. |
+| `POST /api/reviews` | Reviewer/admin decision: `finding_id`, `status`, optional `owner` and `note`. |
+| `GET /api/campaigns` | Campaign assignments visible to the signed-in principal. |
+| `POST /api/campaigns` | Create a campaign with `due_on`, `default_owner`, optional `campaign_id` and per-finding `assignments`. |
+| `POST /api/campaigns/decision` | Assigned owner decision with `campaign_id`, `finding_id`, `decision`, and optional `note`. |
+| `GET /api/session` | Current signed-in actor and CSRF token for cookie sessions. |
+| `GET /auth/login` | Start the configured OIDC or SAML login flow. |
+| `POST /auth/logout` | End the current server-side session. |
+| `GET /healthz` | Minimal unauthenticated container liveness response. |
+
+Review writes require `--review-file`. Invalid review decisions and findings are rejected.
+
+### Container deployment
+
+The included Compose service runs as a non-root user, limits source mounts to read-only, stores review and exception state in `./state`, and exposes its port only on loopback. Create local `data/` exports (`hr.csv`, `usage.csv`, `billing.csv`, optional `contract-pricing.csv`) and `config/config.toml`, then set a long random token in your deployment environment:
+
+```bash
+mkdir -p data config
+cp config.example.toml config/config.toml
+export SAAS_SENTRY_DASHBOARD_USERS='[{"actor":"finops@example.com","role":"reviewer","token":"<at-least-24-random-characters>"}]'
+docker compose up --build -d
+docker compose ps
+```
+
+Do not commit tokens or source exports. Review decisions and exceptions live in the persistent `sentry_state` Docker volume; back it up as organization-controlled sensitive data before upgrades or migrations. For shared or remote deployment, use a TLS reverse proxy and your normal network access controls. SQLite ledgers are supported by the CLI for action and access-review events; the dashboard review file remains CSV.
 
 | Endpoint | Response |
 | --- | --- |

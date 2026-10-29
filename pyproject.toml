@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
 authors = [{name = "SaaS Sentry contributors"}]
-dependencies = []
+dependencies = ["Authlib>=1.7,<2", "python3-saml>=1.16,<2"]
 
 [project.scripts]
 saas-sentry = "saas_sentry.cli:main"
