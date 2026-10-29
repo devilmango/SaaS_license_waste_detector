@@ -10,6 +10,7 @@ import uuid
 from typing import Iterable
 
 from .engine import InputError, normalize_email
+from .storage import append_event as append_sqlite_event, is_sqlite_path, read_events as read_sqlite_events
 
 
 FIELDS = (
@@ -41,14 +42,21 @@ def _app(value: str) -> str:
 def _load(path: Path) -> dict[str, dict[str, str]]:
     if not path.exists():
         return {}
-    try:
-        with path.open("r", encoding="utf-8-sig", newline="") as handle:
-            reader = csv.DictReader(handle)
-            if not set(FIELDS).issubset(reader.fieldnames or []):
-                raise InputError(f"{path}: exception ledger is missing required columns")
-            events = list(reader)
-    except OSError as exc:
-        raise InputError(f"Cannot read exception ledger {path}: {exc}") from exc
+    if is_sqlite_path(path):
+        events = read_sqlite_events(path, "exception_events")
+    else:
+        try:
+            with path.open("r", encoding="utf-8-sig", newline="") as handle:
+                reader = csv.DictReader(handle)
+                if not set(FIELDS).issubset(reader.fieldnames or []):
+                    raise InputError(f"{path}: exception ledger is missing required columns")
+                events = list(reader)
+        except OSError as exc:
+            raise InputError(f"Cannot read exception ledger {path}: {exc}") from exc
+    return _parse_events(path, events)
+
+
+def _parse_events(path: Path, events: list[dict[str, str]]) -> dict[str, dict[str, str]]:
     states: dict[str, dict[str, str]] = {}
     for line, event in enumerate(events, start=2):
         exception_id, kind = event.get("exception_id", "").strip(), event.get("event", "")
@@ -109,6 +117,12 @@ def _load(path: Path) -> dict[str, dict[str, str]]:
 
 
 def _append(path: Path, event: dict[str, str]) -> None:
+    if is_sqlite_path(path):
+        append_sqlite_event(
+            path, "exception_events", FIELDS, event,
+            validate=lambda events: _parse_events(path, events),
+        )
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_name(path.name + ".lock")
     try:

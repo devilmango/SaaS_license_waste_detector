@@ -206,7 +206,7 @@ These are planning estimates, not guaranteed cash savings. The model assumes ann
 
 ## Review workflow
 
-Findings have stable IDs. Set a review state, owner, note, and date in a local CSV ledger:
+Findings have stable IDs. Set a review state, owner, note, and date in a local CSV ledger or a shared SQLite database:
 
 ```bash
 saas-sentry review set --file reviews.csv \
@@ -215,7 +215,7 @@ saas-sentry review set --file reviews.csv \
 saas-sentry review list --file reviews.csv
 ```
 
-Statuses are `confirmed`, `dismissed`, and `deferred`. Add `--review-file reviews.csv` to analysis to include saved decisions in the findings CSV and report. The ledger retains the latest decision per finding; updates replace that row.
+Statuses are `confirmed`, `dismissed`, and `deferred`. Add `--review-file reviews.csv` or `--review-file sentry.sqlite` to analysis to include saved decisions in the findings CSV and report. CSV stores the latest decision per finding; SQLite keeps each decision as an audit event and presents the latest decision to analysis.
 
 ## Microsoft 365 connector
 
@@ -414,7 +414,7 @@ The action list reports status, owner, proposer, approver, estimated savings, ac
 
 ### Shared SQLite event ledgers
 
-Action and access-review event ledgers accept `.db`, `.sqlite`, or `.sqlite3` paths. Their events live in separate tables, so the same database file can be passed to both workflows. SQLite transactions serialize concurrent writes and validate a state change against the current event history before appending it. CSV remains supported for simple local workflows.
+Action, access-review, analyst review, exception, and seat reassignment event ledgers accept `.db`, `.sqlite`, or `.sqlite3` paths. Each workflow writes to its own table, so one database can hold all operator decisions and lifecycle events. SQLite transactions serialize concurrent writes and validate a state change against the current event history before appending it. CSV remains supported for simple local workflows.
 
 ```bash
 # Use one database for action and campaign events.
@@ -422,12 +422,29 @@ saas-sentry actions propose --findings findings.csv --file saas-sentry.sqlite \
   --finding-id 0123456789abcdef --owner FinOps --proposed-by analyst@example.com
 saas-sentry access-review create --findings findings.csv --ledger saas-sentry.sqlite \
   --due-on 2026-11-01 --created-by finops@example.com --default-owner app-owner@example.com
+saas-sentry review set --file saas-sentry.sqlite --finding-id 0123456789abcdef \
+  --status confirmed --owner FinOps
+saas-sentry exceptions request --ledger saas-sentry.sqlite --email user@example.com \
+  --application Slack --reason "On-call access" --requested-by owner@example.com \
+  --expires-on 2026-12-01 --evidence-ref ticket-123
+saas-sentry reassignment stage --plan transfers.csv --ledger saas-sentry.sqlite \
+  --staged-by analyst@example.com
 
-# Migrate an existing, validated CSV event ledger once.
+# Migrate existing validated CSV ledgers once; repeat for each ledger kind.
 saas-sentry ledger migrate --kind actions --source actions.csv --database saas-sentry.sqlite
+saas-sentry ledger migrate --kind reviews --source reviews.csv --database saas-sentry.sqlite
+saas-sentry ledger migrate --kind exceptions --source exception-events.csv --database saas-sentry.sqlite
+saas-sentry ledger migrate --kind reassignments --source reassignment-events.csv --database saas-sentry.sqlite
 ```
 
-The migration refuses to overwrite an existing table of the same ledger type. Review access to the database file as it contains employee and approver data.
+Each SQLite database tracks its schema version in `schema_migrations`. The migration command validates legacy rows and refuses to import a ledger kind whose destination table already has events. Back up before migrations or upgrades. The SQLite online backup API captures a consistent database while the service is running; restore validates database integrity and replaces the chosen destination path:
+
+```bash
+saas-sentry ledger backup --database state/sentry.sqlite --output backups/sentry-2026-10-29.sqlite
+saas-sentry ledger restore --backup backups/sentry-2026-10-29.sqlite --database state/sentry.sqlite
+```
+
+Store backups with the same access controls and retention rules as the live database because they contain employee identities, reviewer decisions, exception evidence, and reassignment history. Stop writers before restoring and retain a separate copy of the current database until the restored state has been checked.
 
 ### Savings realization report
 
@@ -542,7 +559,7 @@ The report includes baseline/current spend, modeled annual savings, annualized i
 
 ### Scheduled provider syncs
 
-Run provider import and analysis once with `--once`, or keep the process running with `--every-hours`. Each cycle writes refreshed `usage.csv`, `billing.csv`, and provider metadata under the output directory, then creates a timestamped analysis/report directory and snapshot history. Scheduling runs in the foreground; use a process supervisor or scheduler for persistent operation. Add both action and execution ledgers to verify completed reclaims after each fresh import:
+Run provider import and analysis once with `--once`, or keep the process running with `--every-hours`. For a daily local wall-clock schedule, pass `--schedule-time HH:MM --timezone Area/City` using an IANA timezone. Scheduled sync and report cycles retry twice by default with capped exponential backoff; tune this with `--retries` and `--retry-delay`. Each output directory records the latest outcome in `schedule-health.json` and appends exhausted failures to `schedule-failures.csv`. Configure `--alerts-webhook-url` (or `SAAS_SENTRY_WEBHOOK_URL`) to preview failure alerts; add `--send-alerts` to deliver them. Scheduling runs in the foreground; use a process supervisor for persistent operation. Add both action and execution ledgers to verify completed reclaims after each fresh import:
 
 ```bash
 saas-sentry sync --provider microsoft365 --hr hr.csv --pricing m365-pricing.csv \
@@ -788,7 +805,7 @@ docker compose up --build -d
 docker compose ps
 ```
 
-Do not commit tokens or source exports. Review decisions and exceptions live in the persistent `sentry_state` Docker volume; back it up as organization-controlled sensitive data before upgrades or migrations. For shared or remote deployment, use a TLS reverse proxy and your normal network access controls. SQLite ledgers are supported by the CLI for action and access-review events; the dashboard review file remains CSV.
+Do not commit tokens or source exports. Review decisions and exceptions live in the persistent `sentry_state` Docker volume; back it up as organization-controlled sensitive data before upgrades or migrations. For shared or remote deployment, use a TLS reverse proxy and your normal network access controls. The dashboard can use the same SQLite database for reviews, exceptions, and access-review campaigns by configuring those paths with a `.sqlite` extension.
 
 | Endpoint | Response |
 | --- | --- |

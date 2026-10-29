@@ -172,9 +172,12 @@ jobs:
           saas-sentry realization --help
           saas-sentry verify-savings --help
           saas-sentry sync --help
+          saas-sentry watch --help
           saas-sentry access-review --help
           saas-sentry access-review deliver-reminders --help
           saas-sentry ledger migrate --help
+          saas-sentry ledger backup --help
+          saas-sentry ledger restore --help
           saas-sentry identity --help
           saas-sentry identity import-entra --help
           saas-sentry identity import-scim --help
@@ -211,4 +214,6 @@ jobs:
           --config config.example.toml
           --output-dir scheduled-reports
           --alerts-webhook-url https://example.invalid/webhook
+          --schedule-time 08:30
+          --timezone Asia/Kolkata
           --once

@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 from dataclasses import replace
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import json
 import math
@@ -68,7 +68,8 @@ from .policy import (
     revoke_exception,
 )
 from .dashboard import create_server, load_dashboard_users
-from .storage import migrate_csv_ledger
+from .storage import backup_database, migrate_csv_ledger, restore_database
+from .scheduling import next_run, run_with_retry, write_health
 from .engine import (
     InputError,
     analyze,
@@ -394,9 +395,15 @@ def build_parser() -> argparse.ArgumentParser:
     ledger = subparsers.add_parser("ledger", help="migrate supported CSV event ledgers into SQLite")
     ledger_commands = ledger.add_subparsers(dest="ledger_command", required=True)
     ledger_migrate = ledger_commands.add_parser("migrate", help="copy and validate a CSV event log into SQLite")
-    ledger_migrate.add_argument("--kind", choices=("actions", "access-review"), required=True)
+    ledger_migrate.add_argument("--kind", choices=("actions", "access-review", "reviews", "exceptions", "reassignments"), required=True)
     ledger_migrate.add_argument("--source", type=Path, required=True)
     ledger_migrate.add_argument("--database", type=Path, required=True, help="shared .db, .sqlite, or .sqlite3 destination")
+    ledger_backup = ledger_commands.add_parser("backup", help="create a consistent online SQLite backup")
+    ledger_backup.add_argument("--database", type=Path, required=True)
+    ledger_backup.add_argument("--output", type=Path, required=True)
+    ledger_restore = ledger_commands.add_parser("restore", help="restore a SQLite backup to a database path")
+    ledger_restore.add_argument("--backup", type=Path, required=True)
+    ledger_restore.add_argument("--database", type=Path, required=True)
 
     reassign = subparsers.add_parser(
         "reassign", help="match confirmed reclaim candidates to active license requests",
@@ -613,8 +620,13 @@ def build_parser() -> argparse.ArgumentParser:
     watch.add_argument("--exceptions", type=Path)
     watch.add_argument("--output-dir", type=Path, required=True)
     watch.add_argument("--every-hours", type=float, default=24.0)
+    watch.add_argument("--schedule-time", help="daily local run time in HH:MM; overrides --every-hours")
+    watch.add_argument("--timezone", default="UTC", help="IANA timezone for --schedule-time (default: UTC)")
+    watch.add_argument("--retries", type=_nonnegative, default=2, help="retries per run with exponential backoff")
+    watch.add_argument("--retry-delay", type=float, default=5.0, help="initial retry delay in seconds")
     watch.add_argument("--alerts-webhook-url", default=os.environ.get("SAAS_SENTRY_WEBHOOK_URL", ""), help="optional HTTPS webhook for detected report changes")
     watch.add_argument("--send-alerts", action="store_true", help="deliver alerts; default is preview only")
+    watch.add_argument("--health-file", type=Path, help="durable latest-run health JSON; defaults inside output-dir")
     watch.add_argument("--once", action="store_true", help="write one scheduled report and exit")
 
     sync = subparsers.add_parser("sync", help="import a provider on a schedule and analyze each refreshed export")
@@ -635,6 +647,13 @@ def build_parser() -> argparse.ArgumentParser:
     sync.add_argument("--lookback-days", type=_nonnegative, default=90)
     sync.add_argument("--team-id", default="", help="Slack workspace ID when using an organization token")
     sync.add_argument("--every-hours", type=float, default=24.0)
+    sync.add_argument("--schedule-time", help="daily local sync time in HH:MM; overrides --every-hours")
+    sync.add_argument("--timezone", default="UTC", help="IANA timezone for --schedule-time (default: UTC)")
+    sync.add_argument("--retries", type=_nonnegative, default=2, help="retries per run with exponential backoff")
+    sync.add_argument("--retry-delay", type=float, default=5.0, help="initial retry delay in seconds")
+    sync.add_argument("--alerts-webhook-url", default=os.environ.get("SAAS_SENTRY_WEBHOOK_URL", ""), help="optional HTTPS webhook for failed scheduled runs")
+    sync.add_argument("--send-alerts", action="store_true", help="deliver failure alerts; default is preview only")
+    sync.add_argument("--health-file", type=Path, help="durable latest-run health JSON; defaults inside output-dir")
     sync.add_argument("--once", action="store_true", help="sync, analyze once, and exit")
     return parser
 
@@ -1074,6 +1093,14 @@ def _contracts(args: argparse.Namespace) -> int:
 
 
 def _ledger(args: argparse.Namespace) -> int:
+    if args.ledger_command == "backup":
+        backup_database(args.database, args.output)
+        print(f"Created consistent SQLite backup at {args.output}.")
+        return 0
+    if args.ledger_command == "restore":
+        restore_database(args.backup, args.database)
+        print(f"Restored SQLite backup to {args.database}.")
+        return 0
     count = migrate_csv_ledger(args.source, args.database, args.kind)
     print(f"Migrated {count} {args.kind} events from {args.source} to {args.database}.")
     return 0
@@ -1357,37 +1384,134 @@ def _contract_model(args: argparse.Namespace) -> int:
     return 0
 
 
-def _watch(args: argparse.Namespace) -> int:
-    if not math.isfinite(args.every_hours) or args.every_hours <= 0:
+def _next_scheduled_at(args: argparse.Namespace) -> datetime | None:
+    schedule_time = getattr(args, "schedule_time", None)
+    zone = getattr(args, "timezone", "UTC")
+    if schedule_time:
+        try:
+            return next_run(datetime.now(timezone.utc), schedule_time, zone)
+        except ValueError as exc:
+            raise InputError(str(exc)) from exc
+    every_hours = getattr(args, "every_hours", 24.0)
+    if not math.isfinite(every_hours) or every_hours <= 0:
         raise InputError("--every-hours must be greater than zero")
+    return datetime.now(timezone.utc) + timedelta(hours=every_hours)
+
+
+def _failure_alert(args: argparse.Namespace, output_dir: Path, *, job: str, error: Exception) -> None:
+    failure_log = output_dir / "schedule-failures.csv"
+    exists = failure_log.exists() and failure_log.stat().st_size > 0
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with failure_log.open("a", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=("occurred_at", "job", "error_type", "message"))
+        if not exists:
+            writer.writeheader()
+        writer.writerow({
+            "occurred_at": datetime.now(timezone.utc).isoformat(),
+            "job": job,
+            "error_type": type(error).__name__,
+            "message": str(error).replace("\r", " ").replace("\n", " ")[:500],
+        })
+    webhook = getattr(args, "alerts_webhook_url", "")
+    if not webhook:
+        return
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    alert_path = output_dir / f"schedule-failure-{stamp}.csv"
+    _write_text(alert_path, format_anomalies(({
+        "severity": "critical", "kind": "scheduled_run_failed", "scope": job,
+        "baseline_value": "", "current_value": "failed", "change": "",
+        "summary": f"Scheduled {job} failed after retries: {type(error).__name__}: {str(error)[:240]}",
+    },)))
+    try:
+        pending, delivered = deliver_alerts(
+            alert_path, output_dir / "schedule-alert-deliveries.csv",
+            webhook_url=webhook, send=bool(getattr(args, "send_alerts", False)),
+        )
+        print(f"Schedule failure alert: {delivered} sent; {pending - delivered} pending.")
+    except InputError as delivery_error:
+        print(f"Schedule failure alert delivery error: {delivery_error}", file=sys.stderr)
+
+
+def _run_scheduled(args: argparse.Namespace, operation, *, job: str, output_dir: Path) -> None:
+    retries = getattr(args, "retries", 2)
+    delay = getattr(args, "retry_delay", 5.0)
+    if delay < 0 or not math.isfinite(delay):
+        raise InputError("--retry-delay must be finite and non-negative")
+    started = datetime.now(timezone.utc)
+    attempts = 0
+
+    def counted_operation():
+        nonlocal attempts
+        attempts += 1
+        return operation()
+
+    try:
+        run_with_retry(counted_operation, retries=retries, base_delay=delay)
+    except Exception as exc:
+        next_at = None if getattr(args, "once", False) else _next_scheduled_at(args)
+        health_path = getattr(args, "health_file", None) or output_dir / "schedule-health.json"
+        write_health(
+            health_path, status="failed", attempts=attempts,
+            timezone_name=getattr(args, "timezone", "UTC"), last_started_at=started,
+            next_scheduled_at=next_at, error=f"{type(exc).__name__}: {exc}",
+        )
+        _failure_alert(args, output_dir, job=job, error=exc)
+        if getattr(args, "once", False):
+            raise InputError(f"Scheduled {job} failed after {attempts} attempt(s): {exc}") from exc
+        print(f"Scheduled {job} failed after {attempts} attempt(s): {exc}", file=sys.stderr)
+    else:
+        next_at = None if getattr(args, "once", False) else _next_scheduled_at(args)
+        health_path = getattr(args, "health_file", None) or output_dir / "schedule-health.json"
+        write_health(
+            health_path, status="healthy", attempts=attempts,
+            timezone_name=getattr(args, "timezone", "UTC"), last_started_at=started,
+            next_scheduled_at=next_at,
+        )
+
+
+def _sleep_until(args: argparse.Namespace) -> None:
+    target = _next_scheduled_at(args)
+    if target is None:
+        return
+    schedule_time = getattr(args, "schedule_time", None)
+    if schedule_time:
+        print(f"Next run at {target.isoformat()} ({args.timezone}). Stop with Ctrl-C.")
+    else:
+        print(f"Next scheduled run in {args.every_hours:g} hours. Stop with Ctrl-C.")
+    time.sleep(max(0.0, (target - datetime.now(timezone.utc)).total_seconds()))
+
+
+def _watch(args: argparse.Namespace) -> int:
+    _next_scheduled_at(args)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     while True:
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-        args.output_csv = args.output_dir / f"findings-{stamp}.csv"
-        args.quality_csv = args.output_dir / f"quality-{stamp}.csv"
-        args.output_json = args.output_dir / f"report-{stamp}.json"
-        args.output_html = args.output_dir / f"report-{stamp}.html"
-        args.showback_csv = args.output_dir / f"showback-{stamp}.csv"
-        args.renewals_csv = args.output_dir / f"renewals-{stamp}.csv"
-        args.snapshot_dir = args.output_dir / "snapshots"
-        args.as_of = None
-        _analyze(args)
-        if args.alerts_webhook_url:
-            snapshots = list_snapshots(args.snapshot_dir)
-            current = snapshots[-1][1] if snapshots else None
-            baseline = snapshots[-2][1] if len(snapshots) > 1 else None
-            anomalies = detect_anomalies(current, baseline=baseline) if current else ()
-            alerts_path = args.output_dir / f"alerts-{stamp}.csv"
-            _write_text(alerts_path, format_anomalies(anomalies))
-            pending, delivered = deliver_alerts(
-                alerts_path, args.output_dir / "alert-deliveries.csv",
-                webhook_url=args.alerts_webhook_url, send=args.send_alerts,
-            )
-            print(f"Scheduled alert delivery: {delivered} sent; {pending - delivered} pending or already delivered.")
+        def cycle():
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+            args.output_csv = args.output_dir / f"findings-{stamp}.csv"
+            args.quality_csv = args.output_dir / f"quality-{stamp}.csv"
+            args.output_json = args.output_dir / f"report-{stamp}.json"
+            args.output_html = args.output_dir / f"report-{stamp}.html"
+            args.showback_csv = args.output_dir / f"showback-{stamp}.csv"
+            args.renewals_csv = args.output_dir / f"renewals-{stamp}.csv"
+            args.snapshot_dir = args.output_dir / "snapshots"
+            args.as_of = None
+            _analyze(args)
+            if args.alerts_webhook_url:
+                snapshots = list_snapshots(args.snapshot_dir)
+                current = snapshots[-1][1] if snapshots else None
+                baseline = snapshots[-2][1] if len(snapshots) > 1 else None
+                anomalies = detect_anomalies(current, baseline=baseline) if current else ()
+                alerts_path = args.output_dir / f"alerts-{stamp}.csv"
+                _write_text(alerts_path, format_anomalies(anomalies))
+                pending, delivered = deliver_alerts(
+                    alerts_path, args.output_dir / "alert-deliveries.csv",
+                    webhook_url=args.alerts_webhook_url, send=args.send_alerts,
+                )
+                print(f"Scheduled alert delivery: {delivered} sent; {pending - delivered} pending or already delivered.")
+        _run_scheduled(args, cycle, job="report", output_dir=args.output_dir)
         if args.once:
             return 0
-        print(f"Next scheduled analysis in {args.every_hours:g} hours. Stop with Ctrl-C.")
-        time.sleep(args.every_hours * 3600)
+        _sleep_until(args)
 
 
 def _sync_once(args: argparse.Namespace) -> tuple[int, int]:
@@ -1453,8 +1577,7 @@ def _sync_once(args: argparse.Namespace) -> tuple[int, int]:
 
 
 def _sync(args: argparse.Namespace) -> int:
-    if not math.isfinite(args.every_hours) or args.every_hours <= 0:
-        raise InputError("--every-hours must be greater than zero")
+    _next_scheduled_at(args)
     protected = {args.hr.resolve(), args.pricing.resolve()}
     for path in (args.contract_pricing, args.config, args.review_file, args.exceptions, args.identity_map):
         if path:
@@ -1468,12 +1591,13 @@ def _sync(args: argparse.Namespace) -> int:
     if getattr(args, "verification_ledger", None) and not action_ledger:
         raise InputError("--verification-ledger requires --action-ledger and --execution-ledger")
     while True:
-        users, assignments = _sync_once(args)
-        print(f"Synced {args.provider}: {users} users and {assignments} license assignments.")
+        def cycle():
+            users, assignments = _sync_once(args)
+            print(f"Synced {args.provider}: {users} users and {assignments} license assignments.")
+        _run_scheduled(args, cycle, job=f"{args.provider} import and report", output_dir=args.output_dir)
         if args.once:
             return 0
-        print(f"Next provider sync in {args.every_hours:g} hours. Stop with Ctrl-C.")
-        time.sleep(args.every_hours * 3600)
+        _sleep_until(args)
 
 
 def main() -> int:

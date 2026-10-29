@@ -7,6 +7,7 @@ from datetime import date
 from pathlib import Path
 
 from .engine import InputError
+from .storage import append_event as append_sqlite_event, is_sqlite_path, read_events as read_sqlite_events
 
 
 FIELDS = ("finding_id", "application", "contract_id", "from_email", "to_email", "status", "actor", "on", "evidence_ref", "note")
@@ -15,14 +16,25 @@ FIELDS = ("finding_id", "application", "contract_id", "from_email", "to_email", 
 def _states(path: Path) -> dict[str, dict[str, str]]:
     if not path.exists():
         return {}
+    if is_sqlite_path(path):
+        events = read_sqlite_events(path, "reassignment_events")
+    else:
+        events = _read_csv_events(path)
+    return _parse_events(path, events)
+
+
+def _read_csv_events(path: Path) -> list[dict[str, str]]:
     try:
         with path.open("r", encoding="utf-8-sig", newline="") as handle:
             reader = csv.DictReader(handle)
             if not set(FIELDS).issubset(reader.fieldnames or []):
                 raise InputError(f"{path}: reassignment ledger is missing required columns")
-            events = list(reader)
+            return list(reader)
     except OSError as exc:
         raise InputError(f"Cannot read reassignment ledger {path}: {exc}") from exc
+
+
+def _parse_events(path: Path, events: list[dict[str, str]]) -> dict[str, dict[str, str]]:
     states: dict[str, dict[str, str]] = {}
     for line, event in enumerate(events, start=2):
         key, status = event.get("finding_id", ""), event.get("status", "")
@@ -50,6 +62,12 @@ def _states(path: Path) -> dict[str, dict[str, str]]:
 
 
 def _append(path: Path, event: dict[str, str]) -> None:
+    if is_sqlite_path(path):
+        append_sqlite_event(
+            path, "reassignment_events", FIELDS, event,
+            validate=lambda events: _parse_events(path, events),
+        )
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     exists = path.exists() and path.stat().st_size > 0
     with path.open("a", encoding="utf-8", newline="") as handle:

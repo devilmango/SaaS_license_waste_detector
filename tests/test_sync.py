@@ -3,13 +3,58 @@ from __future__ import annotations
 from argparse import Namespace
 from pathlib import Path
 import tempfile
+import json
 import unittest
 from unittest.mock import patch
 
-from saas_sentry.cli import _sync_once, build_parser
+from saas_sentry.cli import _run_scheduled, _sync_once, build_parser
 
 
 class ScheduledSyncTests(unittest.TestCase):
+    def test_sync_cli_accepts_timezone_schedule_retries_and_health_path(self) -> None:
+        args = build_parser().parse_args([
+            "sync", "--provider", "zoom", "--hr", "hr.csv", "--pricing", "pricing.csv",
+            "--output-dir", "out", "--schedule-time", "08:15", "--timezone", "Asia/Kolkata",
+            "--retries", "4", "--retry-delay", "2", "--health-file", "health.json",
+        ])
+        self.assertEqual(args.schedule_time, "08:15")
+        self.assertEqual(args.timezone, "Asia/Kolkata")
+        self.assertEqual(args.retries, 4)
+        self.assertEqual(args.health_file, Path("health.json"))
+
+    def test_scheduled_run_persists_health_after_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            args = Namespace(
+                retries=1, retry_delay=0, once=True, timezone="UTC", health_file=None,
+            )
+            attempts = []
+
+            def operation():
+                attempts.append(1)
+                if len(attempts) == 1:
+                    raise RuntimeError("temporary provider error")
+
+            _run_scheduled(args, operation, job="test import", output_dir=root)
+            health = json.loads((root / "schedule-health.json").read_text(encoding="utf-8"))
+            self.assertEqual(health["status"], "healthy")
+            self.assertEqual(health["attempts"], 2)
+            self.assertEqual(health["error"], "")
+
+    def test_failed_one_shot_persists_failure_and_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            args = Namespace(
+                retries=0, retry_delay=0, once=True, timezone="UTC", health_file=None,
+            )
+            with self.assertRaisesRegex(Exception, "failed after 1 attempt"):
+                _run_scheduled(args, lambda: (_ for _ in ()).throw(RuntimeError("offline")),
+                               job="test import", output_dir=root)
+            health = json.loads((root / "schedule-health.json").read_text(encoding="utf-8"))
+            self.assertEqual(health["status"], "failed")
+            self.assertIn("offline", health["error"])
+            self.assertIn("offline", (root / "schedule-failures.csv").read_text(encoding="utf-8"))
+
     def test_sync_cli_accepts_zoom_and_one_shot_schedule(self) -> None:
         args = build_parser().parse_args([
             "sync", "--provider", "zoom", "--hr", "hr.csv", "--pricing", "pricing.csv",

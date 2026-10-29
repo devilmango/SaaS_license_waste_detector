@@ -893,6 +893,23 @@ def format_quality_csv(analysis: Analysis) -> str:
 def load_reviews(path: Path | None) -> dict[str, dict[str, str]]:
     if path is None or not path.exists():
         return {}
+    from .storage import is_sqlite_path, read_events
+
+    if is_sqlite_path(path):
+        rows = read_events(path, "review_events")
+        records: dict[str, dict[str, str]] = {}
+        fields = {"finding_id", "status", "owner", "note", "reviewed_on"}
+        for line, row in enumerate(rows, start=2):
+            finding_id, status = row.get("finding_id", ""), row.get("status", "")
+            if not finding_id:
+                raise InputError(f"{path}:{line}: finding_id cannot be blank")
+            if status not in {"confirmed", "dismissed", "deferred"}:
+                raise InputError(f"{path}:{line}: status must be confirmed, dismissed, or deferred")
+            if not row.get("reviewed_on", ""):
+                raise InputError(f"{path}:{line}: reviewed_on cannot be blank")
+            _parse_date(row["reviewed_on"], path, line, "reviewed_on")
+            records[finding_id] = {field: row.get(field, "") for field in fields}
+        return records
     rows = _rows(path, {"finding_id", "status", "owner", "note", "reviewed_on"})
     records: dict[str, dict[str, str]] = {}
     for line, row in enumerate(rows, start=2):
@@ -929,6 +946,19 @@ def update_review(
         "finding_id": finding_id, "status": status, "owner": owner,
         "note": note, "reviewed_on": (reviewed_on or date.today()).isoformat(),
     }
+    from .storage import append_event, is_sqlite_path
+
+    if is_sqlite_path(path):
+        event = records[finding_id]
+
+        def validate(events: list[dict[str, str]]) -> None:
+            if not event["finding_id"] or event["status"] not in {"confirmed", "dismissed", "deferred"}:
+                raise InputError("invalid review decision")
+            _parse_date(event["reviewed_on"], path, len(events) + 1, "reviewed_on")
+
+        append_event(path, "review_events", ("finding_id", "status", "owner", "note", "reviewed_on"),
+                     event, validate=validate)
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=["finding_id", "status", "owner", "note", "reviewed_on"])
