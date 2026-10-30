@@ -17,7 +17,7 @@ ROLE_LEVEL = {"viewer": 1, "reviewer": 2, "admin": 3}
 ROLE_PERMISSIONS = {
     "viewer": {"report:read", "campaign:read"},
     "reviewer": {"report:read", "campaign:read", "review:write", "campaign:create", "campaign:decide"},
-    "admin": {"report:read", "campaign:read", "review:write", "campaign:create", "campaign:decide", "transfer:execute", "policy:write"},
+    "admin": {"report:read", "campaign:read", "review:write", "campaign:create", "campaign:decide", "transfer:execute", "policy:write", "schedule:read", "schedule:manage"},
 }
 
 

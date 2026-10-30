@@ -13,7 +13,7 @@ import time
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 from http.cookies import SimpleCookie
-from threading import RLock
+from threading import Event, RLock, Thread
 
 from .engine import InputError, analyze, load_config, load_inputs, load_reviews, update_review
 from .access_reviews import create_campaign, decide_campaign_item, list_campaign_items
@@ -22,6 +22,8 @@ from .dashboard_auth import SessionStore, parse_authorization_rules
 from .dashboard_sso import configured_mode, identity_principal, oidc_client_from_environment, saml_auth, transaction
 from .policy import active_exception_keys
 from .reports import report_payload
+from .schedules import create_schedule, list_schedules, run_due_schedules, run_schedule, set_schedule_enabled, update_schedule
+from .storage import _connect
 
 
 _HTML = """<!doctype html>
@@ -48,6 +50,7 @@ button,input{font:inherit}button{min-height:44px;background:var(--green);color:#
 </section><section class="panel"><h2>License findings</h2><label for="search" class="label">Filter findings by app, employee, or status</label><p><input id="search" class="search" type="search" autocomplete="off" placeholder="Search findings"></p>
 <div class="table-wrap"><table><thead><tr><th>Application</th><th>Employee</th><th>Category</th><th>Activity evidence</th><th>Opportunity</th><th>Review</th><th>Campaign owner</th><th>Decision</th></tr></thead><tbody id="findings"><tr><td class="empty" colspan="8">Loading…</td></tr></tbody></table></div></section>
 <section class="panel"><h2>Access review campaigns</h2><form id="campaign-form"><label>Due date <input id="campaign-due" type="date" required></label> <label>Default owner <input id="campaign-owner" type="email" placeholder="Optional when each row has an owner"></label> <button type="submit">Create campaign</button></form><div class="table-wrap" style="margin-top:14px"><table><thead><tr><th>Campaign</th><th>Application</th><th>Finding</th><th>Owner</th><th>Due</th><th>Status</th><th>Decision</th></tr></thead><tbody id="campaigns"><tr><td class="empty" colspan="7">Loading…</td></tr></tbody></table></div></section>
+<section class="panel"><h2>Scheduled reports</h2><form id="schedule-form"><label>Name <input id="schedule-name" maxlength="100" required></label> <label>Local time <input id="schedule-time" type="time" required></label> <label>Timezone <input id="schedule-timezone" value="UTC" placeholder="Asia/Kolkata" required></label> <button type="submit">Create schedule</button></form><p class="foot">Schedules use the selected IANA timezone and run reports from the current dashboard data sources.</p><div class="table-wrap"><table><thead><tr><th>Name</th><th>Local schedule</th><th>Next run</th><th>Last result</th><th>Recent history</th><th>Actions</th></tr></thead><tbody id="schedules"><tr><td class="empty" colspan="6">Loading…</td></tr></tbody></table></div></section>
 <section class="panel"><h2>Renewal calendar</h2><div class="table-wrap"><table><thead><tr><th>Contract</th><th>Applications</th><th>Renewal</th><th>Notice deadline</th><th>Days to notice</th><th>Status</th></tr></thead><tbody id="renewals"><tr><td class="empty" colspan="6">Loading…</td></tr></tbody></table></div></section>
 <p class="foot">Analysis uses configured rules and active approved exceptions. Provider changes are not available here. Data is served by the local SaaS Sentry process.</p></main>
 <script>
@@ -57,8 +60,11 @@ function drawFindings(){const body=document.querySelector('#findings');body.repl
 function drawRenewals(rows){const body=document.querySelector('#renewals');body.replaceChildren();if(!rows.length){const row=body.insertRow();const td=cell(row,'No active contracts to display.');td.colSpan=6;td.className='empty';return}for(const r of rows){const row=body.insertRow();cell(row,r.contract_id);cell(row,r.applications);cell(row,r.renewal_date||'');cell(row,r.notice_deadline||'');cell(row,r.days_until_notice_deadline??'');cell(row,r.status,'status')}}
 async function api(path,options={}){let session={};try{const auth=await fetch('/api/session',{cache:'no-store'});if(auth.ok)session=await auth.json()}catch{}const response=await fetch(path,{...options,headers:{'Content-Type':'application/json','Authorization':`Bearer ${document.querySelector('#token').value}`,'X-CSRF-Token':session.csrf_token||'',...options.headers}});const result=await response.json();if(!response.ok)throw new Error(result.error||`HTTP ${response.status}`);return result}
 async function drawCampaigns(){const body=document.querySelector('#campaigns');body.replaceChildren();try{const rows=(await api('/api/campaigns')).campaigns;if(!rows.length){const tr=body.insertRow();const td=cell(tr,'No campaigns yet.');td.colSpan=7;td.className='empty';return}for(const item of rows){const tr=body.insertRow();cell(tr,item.campaign_id);cell(tr,item.application);cell(tr,item.finding_id);cell(tr,item.owner);cell(tr,item.due_on);cell(tr,item.status,'status');const td=cell(tr,'');if(item.status==='pending'||item.status==='overdue'){const select=document.createElement('select');for(const value of ['confirmed','dismissed','deferred']){const option=document.createElement('option');option.value=value;option.textContent=value;select.append(option)}const button=document.createElement('button');button.textContent='Decide';button.addEventListener('click',async()=>{button.disabled=true;try{await api('/api/campaigns/decision',{method:'POST',body:JSON.stringify({campaign_id:item.campaign_id,finding_id:item.finding_id,decision:select.value})});await refresh()}catch(error){const panel=document.querySelector('#error');panel.textContent=error.message;panel.hidden=false}finally{button.disabled=false}});td.append(select,button)}}}catch(error){body.innerHTML='';const tr=body.insertRow();const td=cell(tr,error.message);td.colSpan=7;td.className='empty'}}
-async function refresh(){const error=document.querySelector('#error');error.hidden=true;document.querySelector('#updated').textContent='Loading the latest analysis…';try{const response=await fetch('/api/report',{headers:{'Accept':'application/json','Authorization':`Bearer ${document.querySelector('#token').value}`},cache:'no-store'});if(!response.ok)throw new Error(response.status===401?'Enter a valid dashboard token':`Analysis returned HTTP ${response.status}`);const report=await response.json();document.querySelector('#licenses').textContent=report.scope_limited?report.findings.length:report.active_license_count;document.querySelector('.cards .card:first-child .label').textContent=report.scope_limited?'Visible findings':'Active licenses analyzed';document.querySelector('#opportunity').textContent=money(report.totals_inr.contract_adjusted_annual_opportunity);document.querySelector('#realizable').textContent=money(report.totals_inr.estimated_realizable_12m);findingRows=report.findings;document.querySelector('#finding-count').textContent=findingRows.length;drawFindings();drawRenewals(report.renewal_calendar);await drawCampaigns();document.querySelector('#updated').textContent=`As of ${report.as_of} · Updated ${new Date(report.generated_at).toLocaleString()}`}catch(err){document.querySelector('#updated').textContent='Could not load the report';error.textContent=err.message;error.hidden=false}}
+async function drawSchedules(){const body=document.querySelector('#schedules');body.replaceChildren();try{const schedules=(await api('/api/schedules')).schedules;if(!schedules.length){const tr=body.insertRow();const td=cell(tr,'No schedules configured.');td.colSpan=6;td.className='empty';return}for(const schedule of schedules){const tr=body.insertRow();const name=document.createElement('input');name.value=schedule.name;name.maxLength=100;name.setAttribute('aria-label','Schedule name');cell(tr,'').append(name);const time=document.createElement('input');time.type='time';time.value=schedule.schedule_time;time.setAttribute('aria-label','Local schedule time');const timezone=document.createElement('input');timezone.value=schedule.timezone;timezone.setAttribute('aria-label','Schedule timezone');const localCell=cell(tr,'');localCell.append(time,timezone);cell(tr,schedule.enabled?(schedule.next_run||''):'Paused');cell(tr,`${schedule.last_result}${schedule.last_error?`: ${schedule.last_error}`:''}`,'status');const history=cell(tr,'');const details=document.createElement('details');const summary=document.createElement('summary');summary.textContent=`${schedule.history.length} recent run(s)`;details.append(summary);for(const run of schedule.history){const item=document.createElement('div');item.textContent=`${run.started_at} · ${run.status} · ${run.attempts} attempt(s)${run.error?` · ${run.error}`:''}`;details.append(item)}history.append(details);const actions=cell(tr,'');const save=document.createElement('button');save.textContent='Save';save.addEventListener('click',async()=>{try{await api(`/api/schedules/${schedule.schedule_id}`,{method:'POST',body:JSON.stringify({name:name.value,schedule_time:time.value,timezone:timezone.value})});await drawSchedules()}catch(error){showError(error)}});const pause=document.createElement('button');pause.textContent=schedule.enabled?'Pause':'Resume';pause.addEventListener('click',async()=>{try{await api(`/api/schedules/${schedule.schedule_id}/pause`,{method:'POST',body:JSON.stringify({paused:schedule.enabled})});await drawSchedules()}catch(error){showError(error)}});const run=document.createElement('button');run.textContent='Run now';run.addEventListener('click',async()=>{run.disabled=true;try{await api(`/api/schedules/${schedule.schedule_id}/run`,{method:'POST'});await drawSchedules()}catch(error){showError(error)}finally{run.disabled=false}});actions.append(save,pause,run)}}catch(error){const tr=body.insertRow();const td=cell(tr,error.message);td.colSpan=6;td.className='empty'}}
+function showError(error){const panel=document.querySelector('#error');panel.textContent=error.message;panel.hidden=false}
+async function refresh(){const error=document.querySelector('#error');error.hidden=true;document.querySelector('#updated').textContent='Loading the latest analysis…';try{const response=await fetch('/api/report',{headers:{'Accept':'application/json','Authorization':`Bearer ${document.querySelector('#token').value}`},cache:'no-store'});if(!response.ok)throw new Error(response.status===401?'Enter a valid dashboard token':`Analysis returned HTTP ${response.status}`);const report=await response.json();document.querySelector('#licenses').textContent=report.scope_limited?report.findings.length:report.active_license_count;document.querySelector('.cards .card:first-child .label').textContent=report.scope_limited?'Visible findings':'Active licenses analyzed';document.querySelector('#opportunity').textContent=money(report.totals_inr.contract_adjusted_annual_opportunity);document.querySelector('#realizable').textContent=money(report.totals_inr.estimated_realizable_12m);findingRows=report.findings;document.querySelector('#finding-count').textContent=findingRows.length;drawFindings();drawRenewals(report.renewal_calendar);await drawCampaigns();await drawSchedules();document.querySelector('#updated').textContent=`As of ${report.as_of} · Updated ${new Date(report.generated_at).toLocaleString()}`}catch(err){document.querySelector('#updated').textContent='Could not load the report';error.textContent=err.message;error.hidden=false}}
 document.querySelector('#campaign-form').addEventListener('submit',async event=>{event.preventDefault();try{const defaultOwner=document.querySelector('#campaign-owner').value;const assignments={};for(const input of document.querySelectorAll('#findings input[data-finding-id]'))assignments[input.dataset.findingId]=input.value.trim()||defaultOwner;await api('/api/campaigns',{method:'POST',body:JSON.stringify({due_on:document.querySelector('#campaign-due').value,default_owner:defaultOwner,assignments})});await refresh()}catch(error){const panel=document.querySelector('#error');panel.textContent=error.message;panel.hidden=false}});
+document.querySelector('#schedule-form').addEventListener('submit',async event=>{event.preventDefault();try{await api('/api/schedules',{method:'POST',body:JSON.stringify({name:document.querySelector('#schedule-name').value,schedule_time:document.querySelector('#schedule-time').value,timezone:document.querySelector('#schedule-timezone').value})});event.target.reset();document.querySelector('#schedule-timezone').value='UTC';await drawSchedules()}catch(error){showError(error)}});
 document.querySelector('#token').value=sessionStorage.getItem('saas-sentry-token')||'';document.querySelector('#token').addEventListener('change',e=>{sessionStorage.setItem('saas-sentry-token',e.target.value);refresh()});document.querySelector('#refresh').addEventListener('click',refresh);document.querySelector('#search').addEventListener('input',drawFindings);refresh();
 </script></body></html>"""
 
@@ -83,7 +89,49 @@ def build_report(
 
 
 def _build_dashboard_report(options: dict[str, Any]) -> dict[str, Any]:
-    return build_report(**{key: value for key, value in options.items() if key != "campaign_ledger"})
+    omitted = {"campaign_ledger", "schedule_db", "schedule_output_dir"}
+    return build_report(**{key: value for key, value in options.items() if key not in omitted})
+
+
+def _run_dashboard_schedule(report_options: dict[str, Any], schedule_id: str) -> dict[str, object] | None:
+    database = report_options.get("schedule_db")
+    if database is None:
+        raise InputError("configure --schedule-db to manage dashboard schedules")
+    output_dir = report_options.get("schedule_output_dir") or (database.parent / "scheduled-reports")
+
+    return run_schedule(
+        database, schedule_id,
+        lambda _job, run_id: _write_scheduled_report(report_options, schedule_id, run_id, output_dir),
+        retries=2, base_delay=1.0,
+    )
+
+
+def _write_scheduled_report(report_options: dict[str, Any], schedule_id: str, run_id: str,
+                            output_dir: Path) -> str:
+    report = _build_dashboard_report(report_options)
+    target = output_dir / f"{schedule_id}-{run_id}.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(target.name + ".tmp")
+    temporary.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(target)
+    return str(target)
+
+
+def _dashboard_schedule_worker(report_options: dict[str, Any], stop: Event) -> None:
+    database = report_options.get("schedule_db")
+    if database is None:
+        return
+    output_dir = report_options.get("schedule_output_dir") or (database.parent / "scheduled-reports")
+    while not stop.wait(5):
+        try:
+            run_due_schedules(
+                database,
+                lambda job, run_id: _write_scheduled_report(
+                    report_options, str(job["schedule_id"]), run_id, output_dir,
+                ),
+            )
+        except Exception as exc:
+            print(f"Dashboard schedule worker error: {type(exc).__name__}: {str(exc)[:300]}")
 
 
 def route_request(method: str, target: str, report_options: dict[str, Any], *,
@@ -92,6 +140,59 @@ def route_request(method: str, target: str, report_options: dict[str, Any], *,
     """Resolve an HTTP request without opening a socket (also used by tests)."""
     route = urlsplit(target)
     principal = principal or Principal(actor, role)
+    schedule_route = route.path.split("/")
+    if route.path == "/api/schedules" and method == "GET":
+        try:
+            authorize(principal, "schedule:read", scope_required=False)
+            database = report_options.get("schedule_db")
+            if database is None:
+                raise InputError("configure --schedule-db to manage dashboard schedules")
+            payload = {"schedules": list_schedules(database)}
+            return 200, "application/json; charset=utf-8", json.dumps(payload, ensure_ascii=False).encode()
+        except AuthorizationError as exc:
+            return 403, "application/json; charset=utf-8", json.dumps({"error": str(exc)}).encode()
+        except (InputError, OSError) as exc:
+            return 400, "application/json; charset=utf-8", json.dumps({"error": str(exc)}).encode()
+    if method == "POST" and schedule_route[1:3] == ["api", "schedules"]:
+        try:
+            authorize(principal, "schedule:manage", scope_required=False)
+            database = report_options.get("schedule_db")
+            if database is None:
+                raise InputError("configure --schedule-db to manage dashboard schedules")
+            payload = json.loads(body or b"{}")
+            if not isinstance(payload, dict):
+                raise ValueError("schedule request must be a JSON object")
+            if len(schedule_route) == 3:
+                schedule = create_schedule(
+                    database, name=str(payload.get("name", "")),
+                    schedule_time=str(payload.get("schedule_time", "")),
+                    timezone_name=str(payload.get("timezone", "")), actor=principal.actor,
+                )
+                return 201, "application/json; charset=utf-8", json.dumps({"schedule": schedule}).encode()
+            schedule_id = schedule_route[3]
+            if len(schedule_route) == 4:
+                schedule = update_schedule(
+                    database, schedule_id, name=str(payload.get("name", "")),
+                    schedule_time=str(payload.get("schedule_time", "")),
+                    timezone_name=str(payload.get("timezone", "")),
+                )
+                return 200, "application/json; charset=utf-8", json.dumps({"schedule": schedule}).encode()
+            if len(schedule_route) == 5 and schedule_route[4] == "pause":
+                if not isinstance(payload.get("paused"), bool):
+                    raise ValueError("paused must be a boolean")
+                schedule = set_schedule_enabled(database, schedule_id, enabled=not payload["paused"])
+                return 200, "application/json; charset=utf-8", json.dumps({"schedule": schedule}).encode()
+            if len(schedule_route) == 5 and schedule_route[4] == "run":
+                run = _run_dashboard_schedule(report_options, schedule_id)
+                if run is None:
+                    return 409, "application/json; charset=utf-8", b'{"error":"schedule run is already in progress"}'
+                status = 200 if run["status"] == "succeeded" else 502
+                return status, "application/json; charset=utf-8", json.dumps({"run": run}).encode()
+            return 404, "application/json; charset=utf-8", b'{"error":"schedule route not found"}'
+        except AuthorizationError as exc:
+            return 403, "application/json; charset=utf-8", json.dumps({"error": str(exc)}).encode()
+        except (ValueError, TypeError, AttributeError, json.JSONDecodeError, InputError, OSError) as exc:
+            return 400, "application/json; charset=utf-8", json.dumps({"error": str(exc)}).encode()
     if method == "POST" and route.path == "/api/reviews":
         try:
             authorize(principal, "review:write")
@@ -469,4 +570,21 @@ def create_server(host: str, port: int, report_options: dict[str, Any], *, users
     sso_mode = configured_mode()
     if host not in {"127.0.0.1", "localhost", "::1"} and not users and not sso_mode:
         raise InputError("non-loopback dashboard binds require authenticated users in the configured environment variable")
-    return ThreadingHTTPServer((host, port), make_handler(report_options, users))
+    server = ThreadingHTTPServer((host, port), make_handler(report_options, users))
+    schedule_db = report_options.get("schedule_db")
+    if schedule_db is not None:
+        # Initialize/migrate the schedule database before starting background work.
+        connection = _connect(schedule_db)
+        connection.close()
+        stop = Event()
+        worker = Thread(target=_dashboard_schedule_worker, args=(report_options, stop), daemon=True)
+        worker.start()
+        original_close = server.server_close
+
+        def close() -> None:
+            stop.set()
+            original_close()
+
+        server.server_close = close  # type: ignore[method-assign]
+        server.schedule_worker = worker  # type: ignore[attr-defined]
+    return server

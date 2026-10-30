@@ -886,6 +886,38 @@ SAAS_SENTRY_WEBHOOK_TOKEN="<secret>" saas-sentry notify \
 
 The URL must use HTTPS and cannot embed credentials. The optional bearer token is read from `SAAS_SENTRY_WEBHOOK_TOKEN`. A delivery is marked only after a successful 2xx response; keep the ledger durable to preserve deduplication across runs.
 
+Delivery attempts use exponential backoff. `--retries` controls additional attempts for one invocation, while `--max-attempts` caps the total number of attempts recorded for an alert across invocations; `--retry-delay` sets the initial delay in seconds. A failed alert that reaches its limit is marked for manual follow-up. Inspect it with `saas-sentry alert-status --ledger alert-deliveries.sqlite`, then explicitly reset selected exhausted items with `--retry-alert-id <id>` before running `notify --send` again. CSV ledgers remain supported; use a `.sqlite`/`.db` path for persistent structured per-alert states.
+
+### Dashboard schedules
+
+Start the dashboard with a persistent schedule database and report directory. Administrators can create and edit recurring jobs, pause or resume them, run them immediately, and inspect recent history, next run, and the latest result from the Schedules panel. The dashboard worker evaluates due jobs while the process is running; keep one dashboard worker active per schedule database.
+
+```bash
+saas-sentry dashboard --hr examples/hr.csv --usage examples/usage.csv \
+  --billing examples/billing.csv --config config.example.toml \
+  --schedule-db state/saas-sentry.sqlite \
+  --schedule-output-dir state/scheduled-reports
+```
+
+Schedule definitions and run history are stored in SQLite and survive dashboard restarts. Use a durable, backed-up database path in deployments; schedule inputs are read when a job runs, so refresh the source exports before the next run.
+
+### SQLite migration and recovery
+
+SQLite ledgers use explicit, versioned migrations and advance automatically when the application opens the database. `ledger verify` is read-only and checks SQLite integrity, foreign keys, supported schema version, and required tables. Backups use SQLite's online backup API and are verified after creation. Preview a restore to see source table counts and which destination tables would be replaced; preview does not modify either file.
+
+```bash
+saas-sentry ledger verify --database state/saas-sentry.sqlite
+saas-sentry ledger backup --database state/saas-sentry.sqlite \
+  --output backups/saas-sentry-2026-10-29.sqlite
+saas-sentry ledger restore --backup backups/saas-sentry-2026-10-29.sqlite \
+  --database state/saas-sentry.sqlite --preview
+# Stop dashboard/scheduler writers before the actual replacement:
+saas-sentry ledger restore --backup backups/saas-sentry-2026-10-29.sqlite \
+  --database state/saas-sentry.sqlite
+```
+
+Keep backups outside the database directory and verify them periodically. Restore copies to a temporary database, upgrades that copy to the current schema, and replaces the destination only after validation succeeds. Stop processes using the destination during restore so they cannot write through stale SQLite connections.
+
 ## Data quality and privacy
 
 `--quality-csv` includes source, row, identity, issue, and remediation detail for unmatched/conflicting records, contract seat floors, and bundles. Conflicting identities are excluded; a unique employee ID or matching email may still resolve with a warning when the other identifier is unknown.

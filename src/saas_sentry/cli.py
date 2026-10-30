@@ -8,6 +8,7 @@ from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import json
+from io import StringIO
 import math
 import os
 from pathlib import Path
@@ -33,7 +34,7 @@ from .connectors import (
     ZoomConnector,
     transfer_provider_license,
 )
-from .alerts import deliver_alerts
+from .alerts import deliver_alerts, list_delivery_records, retry_manual_alert
 from .entitlements import analyze_entitlements, format_entitlements
 from .import_health import build_import_health, format_import_health
 from .realization import build_realization_report, format_realization_report
@@ -68,7 +69,7 @@ from .policy import (
     revoke_exception,
 )
 from .dashboard import create_server, load_dashboard_users
-from .storage import backup_database, migrate_csv_ledger, restore_database
+from .storage import backup_database, migrate_csv_ledger, preview_restore, restore_database, verify_database
 from .scheduling import next_run, run_with_retry, write_health
 from .engine import (
     InputError,
@@ -324,6 +325,14 @@ def build_parser() -> argparse.ArgumentParser:
     notify.add_argument("--ledger", type=Path, default=Path("alert-deliveries.csv"))
     notify.add_argument("--webhook-url", default=os.environ.get("SAAS_SENTRY_WEBHOOK_URL", ""))
     notify.add_argument("--send", action="store_true", help="deliver alerts; default is preview only")
+    notify.add_argument("--retries", type=_nonnegative, default=2, help="retry attempts after the first delivery attempt")
+    notify.add_argument("--max-attempts", type=_nonnegative, default=5, help="maximum cumulative attempts per alert")
+    notify.add_argument("--retry-delay", type=float, default=1.0, help="initial exponential retry delay in seconds")
+
+    alert_status = subparsers.add_parser("alert-status", help="show delivery state and manual follow-up alerts")
+    alert_status.add_argument("--ledger", type=Path, default=Path("alert-deliveries.csv"))
+    alert_status.add_argument("--retry-alert-id", action="append", default=[], help="reset an exhausted alert for operator-requested retry")
+    alert_status.add_argument("--output", type=Path, help="optional CSV export path")
 
     entitlements = subparsers.add_parser(
         "entitlements", help="compare committed contract seats with active assigned licenses",
@@ -404,6 +413,9 @@ def build_parser() -> argparse.ArgumentParser:
     ledger_restore = ledger_commands.add_parser("restore", help="restore a SQLite backup to a database path")
     ledger_restore.add_argument("--backup", type=Path, required=True)
     ledger_restore.add_argument("--database", type=Path, required=True)
+    ledger_restore.add_argument("--preview", action="store_true", help="verify and describe the restore without changing the destination")
+    ledger_verify = ledger_commands.add_parser("verify", help="verify SQLite integrity and current schema")
+    ledger_verify.add_argument("--database", type=Path, required=True)
 
     reassign = subparsers.add_parser(
         "reassign", help="match confirmed reclaim candidates to active license requests",
@@ -528,6 +540,8 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard.add_argument("--config", type=Path)
     dashboard.add_argument("--review-file", type=Path)
     dashboard.add_argument("--campaign-ledger", type=Path, help="append-only access review campaign ledger for dashboard campaigns")
+    dashboard.add_argument("--schedule-db", type=Path, default=Path("state/saas-sentry.sqlite"), help="persistent schedule and history database")
+    dashboard.add_argument("--schedule-output-dir", type=Path, default=Path("state/scheduled-reports"), help="directory for scheduled dashboard report JSON files")
     dashboard.add_argument("--exceptions", type=Path)
     dashboard.add_argument("--as-of", type=date.fromisoformat)
     dashboard.add_argument("--host", default="127.0.0.1", help="bind address; defaults to localhost")
@@ -994,11 +1008,33 @@ def _notify(args: argparse.Namespace) -> int:
         raise InputError("alert delivery ledger cannot overwrite the alerts CSV")
     pending, delivered = deliver_alerts(
         args.alerts, args.ledger, webhook_url=args.webhook_url, send=args.send,
+        retries=args.retries, max_attempts=args.max_attempts, base_delay=args.retry_delay,
     )
     if args.send:
         print(f"Delivered {delivered} new alerts; {pending - delivered} duplicate alerts skipped.")
     else:
         print(f"Preview: {pending} new alerts would be sent. Pass --send to deliver them.")
+    return 0
+
+
+def _alert_status(args: argparse.Namespace) -> int:
+    for alert_id in args.retry_alert_id:
+        retry_manual_alert(args.ledger, alert_id)
+        print(f"Reset {alert_id} for an operator-requested retry.")
+    records = list_delivery_records(args.ledger)
+    content = StringIO()
+    fields = ("alert_id", "status", "attempts", "last_attempt_at", "delivered_at", "destination", "last_error", "manual_follow_up")
+    writer = csv.DictWriter(content, fieldnames=fields)
+    writer.writeheader()
+    for record in records:
+        writer.writerow({field: record.get(field, "") for field in fields})
+    manual = sum(bool(record.get("manual_follow_up")) for record in records)
+    if args.output:
+        _write_text(args.output, content.getvalue())
+        print(f"Exported {len(records)} alert delivery records ({manual} need manual follow-up) to {args.output}.")
+    else:
+        sys.stdout.write(content.getvalue())
+        print(f"Manual follow-up required: {manual}", file=sys.stderr)
     return 0
 
 
@@ -1093,11 +1129,18 @@ def _contracts(args: argparse.Namespace) -> int:
 
 
 def _ledger(args: argparse.Namespace) -> int:
+    if args.ledger_command == "verify":
+        result = verify_database(args.database)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0 if result["valid"] else 1
     if args.ledger_command == "backup":
         backup_database(args.database, args.output)
         print(f"Created consistent SQLite backup at {args.output}.")
         return 0
     if args.ledger_command == "restore":
+        if args.preview:
+            print(json.dumps(preview_restore(args.backup, args.database), ensure_ascii=False, indent=2))
+            return 0
         restore_database(args.backup, args.database)
         print(f"Restored SQLite backup to {args.database}.")
         return 0
@@ -1273,6 +1316,7 @@ def _dashboard(args: argparse.Namespace) -> int:
         "contract_pricing": args.contract_pricing, "config": args.config,
         "review_file": args.review_file, "exceptions": args.exceptions, "as_of": args.as_of,
         "campaign_ledger": args.campaign_ledger,
+        "schedule_db": args.schedule_db, "schedule_output_dir": args.schedule_output_dir,
     }
     users = load_dashboard_users(args.users_env)
     server = create_server(args.host, args.port, options, users=users)
@@ -1626,6 +1670,8 @@ def main() -> int:
             return _monitor(args)
         if args.command == "notify":
             return _notify(args)
+        if args.command == "alert-status":
+            return _alert_status(args)
         if args.command == "entitlements":
             return _entitlements(args)
         if args.command == "import-health":

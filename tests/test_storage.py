@@ -12,7 +12,10 @@ from saas_sentry.actions import ActionError, list_actions, propose_action, trans
 from saas_sentry.engine import load_reviews, update_review
 from saas_sentry.policy import approve_exception, list_exceptions, request_exception
 from saas_sentry.reassignment_workflow import list_states, stage_plan, transition
-from saas_sentry.storage import backup_database, migrate_csv_ledger, restore_database
+from saas_sentry.storage import (
+    backup_database, database_version, migrate_csv_ledger, preview_restore,
+    restore_database, verify_database,
+)
 
 
 class SQLiteLedgerTests(unittest.TestCase):
@@ -137,8 +140,32 @@ class SQLiteLedgerTests(unittest.TestCase):
         backup = self.root / "backup.sqlite"
         restored = self.root / "restored.sqlite"
         backup_database(self.database, backup)
+        verification = verify_database(backup)
+        self.assertTrue(verification["valid"])
+        self.assertEqual(verification["schema_version"], database_version(backup))
         restore_database(backup, restored)
         self.assertEqual(load_reviews(restored)["f-1"]["status"], "confirmed")
+
+    def test_restore_preview_validates_backup_without_replacing_destination(self) -> None:
+        update_review(self.database, "source", "confirmed", reviewed_on=date(2026, 10, 1))
+        backup = self.root / "backup.sqlite"
+        destination = self.root / "destination.sqlite"
+        backup_database(self.database, backup)
+        update_review(destination, "destination", "dismissed", reviewed_on=date(2026, 10, 2))
+        preview = preview_restore(backup, destination)
+        self.assertTrue(preview["backup_valid"])
+        self.assertTrue(preview["will_replace_existing_database"])
+        self.assertEqual(load_reviews(destination)["destination"]["status"], "dismissed")
+
+    def test_existing_schema_version_one_database_is_upgraded_forward(self) -> None:
+        legacy = self.root / "legacy.sqlite"
+        with sqlite3.connect(legacy) as connection:
+            connection.execute("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT)")
+            connection.execute("INSERT INTO schema_migrations VALUES (1, '2026-01-01')")
+        self.assertEqual(database_version(legacy), 3)
+        with sqlite3.connect(legacy) as connection:
+            tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        self.assertTrue({"dashboard_schedules", "dashboard_schedule_runs", "alert_deliveries"}.issubset(tables))
 
     def test_migrates_review_exception_and_reassignment_csv_ledgers(self) -> None:
         reviews = self.root / "reviews.csv"

@@ -103,6 +103,16 @@ jobs:
           saas-sentry access-review deliver-reminders --reminders access-review-reminders.csv \
             --ledger access-review-deliveries.csv --webhook-url https://example.invalid/reviews
 
+      - name: Validate SQLite migration, backup, and restore preview
+        run: |
+          saas-sentry ledger migrate --source access-review-events.csv \
+            --database audit-ledger.sqlite --kind access-review
+          saas-sentry ledger verify --database audit-ledger.sqlite
+          saas-sentry ledger backup --database audit-ledger.sqlite --output audit-ledger-backup.sqlite
+          saas-sentry ledger restore --backup audit-ledger-backup.sqlite \
+            --database audit-ledger-restored.sqlite --preview
+          saas-sentry alert-status --ledger alert-deliveries.csv
+
       - name: Validate procurement imports, seat reassignment, and renewal approvals
         run: |
           saas-sentry procurement import --system coupa \
@@ -177,7 +187,9 @@ jobs:
           saas-sentry access-review deliver-reminders --help
           saas-sentry ledger migrate --help
           saas-sentry ledger backup --help
+          saas-sentry ledger verify --help
           saas-sentry ledger restore --help
+          saas-sentry alert-status --help
           saas-sentry identity --help
           saas-sentry identity import-entra --help
           saas-sentry identity import-scim --help

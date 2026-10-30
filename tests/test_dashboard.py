@@ -102,6 +102,53 @@ class DashboardTests(unittest.TestCase):
                                      body=b'{"due_on":"2026-10-30","default_owner":"owner@example.com"}')
         self.assertEqual(status, 403)
 
+    def test_admin_can_create_edit_pause_run_and_review_schedule_history(self) -> None:
+        self.options["schedule_db"] = self.root / "dashboard.sqlite"
+        admin = Principal("admin@example.com", "admin")
+        status, _, body = route_request(
+            "POST", "/api/schedules", self.options, principal=admin,
+            body=b'{"name":"Daily portfolio","schedule_time":"08:30","timezone":"Asia/Kolkata"}',
+        )
+        self.assertEqual(status, 201, body)
+        schedule = json.loads(body)["schedule"]
+        schedule_id = schedule["schedule_id"]
+        self.assertEqual(schedule["timezone"], "Asia/Kolkata")
+
+        status, _, body = route_request(
+            "POST", f"/api/schedules/{schedule_id}", self.options, principal=admin,
+            body=b'{"name":"Morning portfolio","schedule_time":"09:00","timezone":"UTC"}',
+        )
+        self.assertEqual(status, 200, body)
+        self.assertEqual(json.loads(body)["schedule"]["name"], "Morning portfolio")
+
+        status, _, body = route_request(
+            "POST", f"/api/schedules/{schedule_id}/pause", self.options, principal=admin,
+            body=b'{"paused":true}',
+        )
+        self.assertEqual(status, 200, body)
+        self.assertFalse(json.loads(body)["schedule"]["enabled"])
+
+        status, _, body = route_request(
+            "POST", f"/api/schedules/{schedule_id}/run", self.options, principal=admin,
+        )
+        self.assertEqual(status, 200, body)
+        self.assertEqual(json.loads(body)["run"]["status"], "succeeded")
+
+        status, _, body = route_request("GET", "/api/schedules", self.options, principal=admin)
+        self.assertEqual(status, 200, body)
+        result = json.loads(body)
+        self.assertEqual(result["schedules"][0]["name"], "Morning portfolio")
+        self.assertEqual(result["schedules"][0]["last_result"], "succeeded")
+        self.assertEqual(len(result["schedules"][0]["history"]), 1)
+
+    def test_schedule_management_requires_admin_permission(self) -> None:
+        self.options["schedule_db"] = self.root / "dashboard.sqlite"
+        status, _, _ = route_request(
+            "POST", "/api/schedules", self.options, principal=Principal("reviewer", "reviewer"),
+            body=b'{"name":"Daily","schedule_time":"08:30","timezone":"UTC"}',
+        )
+        self.assertEqual(status, 403)
+
 
 if __name__ == "__main__":
     unittest.main()
