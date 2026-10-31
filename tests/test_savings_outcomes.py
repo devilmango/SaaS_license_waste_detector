@@ -11,6 +11,7 @@ from saas_sentry.actions import propose_action, transition_action
 from saas_sentry.contracts import approve_contract_version, record_contract_version
 from saas_sentry.renewals import create_renewal_campaign, record_owner_decision
 from saas_sentry.savings_outcomes import build_savings_outcomes, format_savings_outcomes
+from saas_sentry.savings_attribution import attribute_savings, format_attributions
 
 
 class SavingsOutcomeTests(unittest.TestCase):
@@ -22,6 +23,7 @@ class SavingsOutcomeTests(unittest.TestCase):
             writer = csv.DictWriter(handle, fieldnames=[
                 "finding_id", "review_status", "contract_adjusted_annual_opportunity_inr",
                 "application", "contract_id", "cost_center", "review_owner",
+                "email", "employee_id",
             ])
             writer.writeheader()
             writer.writerow({"finding_id": "f-1", "review_status": "confirmed",
@@ -87,6 +89,64 @@ class SavingsOutcomeTests(unittest.TestCase):
         self.assertEqual(row.renewal_decision, "renegotiate")
         self.assertEqual(row.renewal_status, "pending_budget_approval")
         self.assertEqual(row.renewal_commitment_change_inr, Decimal("6000.00"))
+
+    def test_action_attribution_matches_identity_and_separates_quantity_from_price(self) -> None:
+        self.completed_action()
+        with self.findings.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=[
+                "finding_id", "review_status", "contract_adjusted_annual_opportunity_inr", "application",
+                "contract_id", "cost_center", "review_owner", "email", "employee_id",
+            ])
+            writer.writeheader()
+            writer.writerow({"finding_id": "f-1", "review_status": "confirmed",
+                             "contract_adjusted_annual_opportunity_inr": "12000", "application": "Chat",
+                             "contract_id": "chat-contract", "cost_center": "ENG", "review_owner": "Owner",
+                             "email": "person@example.com", "employee_id": "E1"})
+        self.write_detailed_invoice(self.baseline, "2026-08-01", "2026-09-01", "30000", "3", "10000", "inv-before")
+        self.write_detailed_invoice(self.current, "2026-09-01", "2026-10-02", "20000", "2", "10000", "inv-after")
+        row, = attribute_savings(self.actions, self.findings, self.baseline, self.current)
+        self.assertEqual(row.confidence, "high")
+        self.assertEqual(row.baseline_invoice_id, "inv-before")
+        self.assertEqual(row.quantity_savings_inr, Decimal("117741.94"))
+        self.assertEqual(row.price_change_inr, Decimal("0.00"))
+        self.assertTrue(row.invoice_reduction_observed)
+        self.assertTrue(row.savings_verified)
+        self.assertIn("confidence_reason", format_attributions([row]))
+
+    def test_price_decrease_is_observed_but_does_not_verify_a_seat_reclaim(self) -> None:
+        self.completed_action()
+        with self.findings.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=[
+                "finding_id", "review_status", "contract_adjusted_annual_opportunity_inr", "application",
+                "contract_id", "cost_center", "review_owner", "email", "employee_id",
+            ])
+            writer.writeheader()
+            writer.writerow({"finding_id": "f-1", "review_status": "confirmed",
+                             "contract_adjusted_annual_opportunity_inr": "12000", "application": "Chat",
+                             "contract_id": "chat-contract", "cost_center": "ENG", "review_owner": "Owner",
+                             "email": "person@example.com", "employee_id": "E1"})
+        self.write_detailed_invoice(self.baseline, "2026-08-01", "2026-09-01", "30000", "3", "10000", "inv-before")
+        self.write_detailed_invoice(self.current, "2026-09-01", "2026-10-02", "27000", "3", "9000", "inv-after")
+        row, = attribute_savings(self.actions, self.findings, self.baseline, self.current)
+        self.assertGreater(row.observed_annualized_reduction_inr, Decimal("0"))
+        self.assertEqual(row.quantity_savings_inr, Decimal("0.00"))
+        self.assertGreater(row.price_change_inr, Decimal("0"))
+        self.assertTrue(row.invoice_reduction_observed)
+        self.assertFalse(row.savings_verified)
+
+    @staticmethod
+    def write_detailed_invoice(path: Path, start: str, end: str, amount: str,
+                               quantity: str, price: str, invoice_id: str) -> None:
+        fields = ["application", "cost_center", "billing_period_start", "billing_period_end",
+                  "actual_billed_cost_inr", "email", "employee_id", "invoice_id", "line_item_id",
+                  "quantity", "unit_price_inr"]
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields)
+            writer.writeheader()
+            writer.writerow({"application": "Chat", "cost_center": "ENG", "billing_period_start": start,
+                             "billing_period_end": end, "actual_billed_cost_inr": amount,
+                             "email": "person@example.com", "employee_id": "E1", "invoice_id": invoice_id,
+                             "line_item_id": "seat-plan", "quantity": quantity, "unit_price_inr": price})
 
 
 if __name__ == "__main__":

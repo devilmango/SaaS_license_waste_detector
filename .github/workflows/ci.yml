@@ -106,6 +106,9 @@ jobs:
           saas-sentry savings-outcomes --actions actions.csv --findings findings.csv \
             --baseline-invoice examples/savings-before.csv \
             --current-invoice examples/savings-after.csv --output savings-outcomes.csv
+          saas-sentry savings-attribution --actions actions.csv --findings findings.csv \
+            --baseline-invoice examples/savings-before.csv \
+            --current-invoice examples/savings-after.csv --output savings-attribution.csv
           saas-sentry contract-model --billing examples/billing.csv \
             --contracts examples/contract-entitlements.csv \
             --contract-pricing examples/contract-pricing.csv \
@@ -136,6 +139,7 @@ jobs:
           ci,zoom,2026-10-04T00:00:00Z,2026-10-04T00:00:01Z,succeeded,1,1,0,
           EOF
           saas-sentry import-history --output-dir provider-import-history
+          saas-sentry import-snapshots --output-dir provider-import-history --provider zoom
 
       - name: Validate procurement imports, seat reassignment, and renewal approvals
         run: |
@@ -164,6 +168,9 @@ jobs:
           saas-sentry renewals create --contracts renewal-contracts.csv \
             --ledger renewal-events.csv --as-of 2026-10-04 --horizon-days 90 \
             --created-by ci@example.com
+          saas-sentry renewals remind --contracts renewal-contracts.csv \
+            --ledger renewal-events.csv --as-of 2026-10-04 \
+            --output renewal-reminders.csv
           saas-sentry renewals decide --ledger renewal-events.csv \
             --contract-id ci-slack --version 1 --decision renegotiate \
             --decided-by finops@example.com --evidence-ref evidence/ci-renewal-review.pdf \
@@ -196,6 +203,10 @@ jobs:
           saas-sentry connect github-copilot --help
           saas-sentry connect zoom --help
           saas-sentry import-history --help
+          saas-sentry import-snapshots --help
+          saas-sentry import-diff --help
+          saas-sentry savings-attribution --help
+          saas-sentry renewals remind --help
           saas-sentry actions --help
           saas-sentry actions execute --help
           saas-sentry actions resolve-execution --help

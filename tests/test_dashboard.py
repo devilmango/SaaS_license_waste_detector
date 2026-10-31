@@ -46,6 +46,7 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("text/html", content_type)
         self.assertIn(b"SaaS Sentry", html)
         self.assertIn(b"/api/report", html)
+        self.assertIn(b"Action-level invoice attribution", html)
 
         status, content_type, body = self.get("/api/report")
         report = json.loads(body)
@@ -185,6 +186,8 @@ class DashboardTests(unittest.TestCase):
         self.assertTrue(result["configured"])
         self.assertEqual(result["outcomes"][0]["owner"], "owner@example.com")
         self.assertEqual(result["outcomes"][0]["period"], "2026-09-01/2026-10-01")
+        self.assertEqual(result["attributions"][0]["confidence"], "low")
+        self.assertFalse(result["attributions"][0]["savings_verified"])
 
 
 if __name__ == "__main__":

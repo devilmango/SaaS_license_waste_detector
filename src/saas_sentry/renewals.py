@@ -38,6 +38,22 @@ class RenewalItem:
     note: str
 
 
+@dataclass(frozen=True)
+class RenewalReminder:
+    contract_id: str
+    version: int
+    vendor: str
+    applications: str
+    owner: str
+    renewal_date: date
+    notice_deadline: date
+    days_until_deadline: int
+    potential_savings_inr: str
+    severity: str
+    window_days: int
+    status: str
+
+
 def _load(path: Path) -> dict[tuple[str, int], dict[str, str]]:
     if not path.exists():
         return {}
@@ -241,4 +257,68 @@ def format_renewals(rows: Iterable[RenewalItem]) -> str:
             row.notice_deadline.isoformat(), row.owner, row.decision, row.decision_by,
             row.budget_status, row.budget_approver, row.evidence_ref, row.status, row.note,
         ])
+    return output.getvalue()
+
+
+def build_renewal_reminders(
+    ledger_path: Path, *, as_of: date, windows: tuple[int, ...] = (90, 30, 7),
+    potential_savings: dict[str, str] | None = None,
+) -> tuple[RenewalReminder, ...]:
+    """Return one reminder per newly reached deadline window, including overdue contracts."""
+    if not windows or any(window < 1 for window in windows):
+        raise InputError("renewal reminder windows must contain positive day counts")
+    ordered = tuple(sorted(set(windows), reverse=True))
+    result = []
+    for item in list_renewals(ledger_path, as_of=as_of):
+        if item.status in {"complete", "budget_rejected"}:
+            continue
+        days = (item.notice_deadline - as_of).days
+        reached = next((window for index, window in enumerate(ordered)
+                        if days <= window and (index == len(ordered) - 1 or days > ordered[index + 1])), None)
+        if days < 0:
+            reached = 0
+        if reached is None:
+            continue
+        severity = "critical" if reached <= 7 else "warning" if reached <= 30 else "info"
+        savings = (potential_savings or {}).get(" ".join(item.contract_id.casefold().split()), "0")
+        result.append(RenewalReminder(
+            item.contract_id, item.version, item.vendor, item.applications, item.owner,
+            item.renewal_date, item.notice_deadline, days, savings, severity, reached, item.status,
+        ))
+    return tuple(sorted(result, key=lambda row: (row.days_until_deadline, row.contract_id.casefold())))
+
+
+def format_renewal_reminders(rows: Iterable[RenewalReminder]) -> str:
+    from io import StringIO
+    output = StringIO()
+    fields = ("contract_id", "version", "vendor", "applications", "owner", "renewal_date",
+              "notice_deadline", "days_until_deadline", "potential_savings_inr", "severity",
+              "window_days", "status")
+    writer = csv.DictWriter(output, fieldnames=fields)
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({**{field: getattr(row, field) for field in fields},
+                         "renewal_date": row.renewal_date.isoformat(),
+                         "notice_deadline": row.notice_deadline.isoformat()})
+    return output.getvalue()
+
+
+def format_renewal_alerts(rows: Iterable[RenewalReminder]) -> str:
+    from io import StringIO
+    output = StringIO()
+    fields = ("severity", "kind", "scope", "baseline_value", "current_value", "change", "summary")
+    writer = csv.DictWriter(output, fieldnames=fields)
+    writer.writeheader()
+    for row in rows:
+        when = "overdue" if row.days_until_deadline < 0 else f"due within {row.window_days} days"
+        writer.writerow({
+            "severity": row.severity, "kind": f"renewal_deadline_{row.window_days}d",
+            "scope": f"contract:{row.contract_id}:owner:{row.owner}",
+            # Keep the alert payload stable throughout the window so webhook delivery is
+            # deduplicated; the exact deadline remains in the summary.
+            "baseline_value": row.window_days, "current_value": row.window_days,
+            "change": 0,
+            "summary": (f"{row.owner}: {row.vendor} contract {row.contract_id} notice deadline is {when} "
+                        f"({row.notice_deadline.isoformat()}); potential annual savings INR {row.potential_savings_inr}"),
+        })
     return output.getvalue()

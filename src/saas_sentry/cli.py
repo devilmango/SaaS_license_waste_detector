@@ -34,7 +34,8 @@ from .connectors import (
     ZoomConnector,
     transfer_provider_license,
 )
-from .provider_imports import run_staged_import
+from .provider_imports import list_import_snapshots, run_staged_import
+from .savings_attribution import attribute_savings, format_attributions
 from .savings_outcomes import build_savings_outcomes, format_savings_outcomes
 from .alerts import deliver_alerts, list_delivery_records, retry_manual_alert
 from .entitlements import analyze_entitlements, format_entitlements
@@ -56,8 +57,11 @@ from .reassignment import format_reassignments, plan_reassignments
 from .reassignment_workflow import list_states, stage_plan, transition as transition_reassignment
 from .transfers import build_transfer_plan, execute_transfer, verify_transfer_snapshot
 from .renewals import (
+    build_renewal_reminders,
     create_renewal_campaign,
     format_renewals,
+    format_renewal_alerts,
+    format_renewal_reminders,
     list_renewals,
     record_budget_approval,
     record_owner_decision,
@@ -204,6 +208,16 @@ def build_parser() -> argparse.ArgumentParser:
     import_history = subparsers.add_parser("import-history", help="inspect provider import results, failures, and rate-limit retries")
     import_history.add_argument("--output-dir", type=Path, required=True, help="provider export directory containing import-history.csv")
     import_history.add_argument("--output", type=Path, help="optional CSV export path")
+
+    import_snapshots = subparsers.add_parser("import-snapshots", help="list validated provider snapshots and assignment changes")
+    import_snapshots.add_argument("--output-dir", type=Path, required=True)
+    import_snapshots.add_argument("--provider", required=True)
+    import_snapshots.add_argument("--output", type=Path)
+    import_diff = subparsers.add_parser("import-diff", help="show assignment changes for one provider snapshot")
+    import_diff.add_argument("--output-dir", type=Path, required=True)
+    import_diff.add_argument("--provider", required=True)
+    import_diff.add_argument("--version", type=_nonnegative, required=True)
+    import_diff.add_argument("--output", type=Path)
 
     focus = subparsers.add_parser("focus", help="normalize FOCUS billing exports")
     focus_actions = focus.add_subparsers(dest="focus_command", required=True)
@@ -506,6 +520,17 @@ def build_parser() -> argparse.ArgumentParser:
     renewal_approve.add_argument("--evidence-ref", required=True)
     renewal_approve.add_argument("--note", default="")
     renewal_approve.add_argument("--on", type=date.fromisoformat)
+    renewal_remind = renewal_commands.add_parser("remind", help="generate owner alerts for reached contract notice windows")
+    renewal_remind.add_argument("--contracts", type=Path, required=True)
+    renewal_remind.add_argument("--ledger", type=Path, default=Path("renewal-events.csv"))
+    renewal_remind.add_argument("--as-of", type=date.fromisoformat, default=date.today())
+    renewal_remind.add_argument("--windows", default="90,30,7", help="comma-separated notice windows in days")
+    renewal_remind.add_argument("--outcomes", type=Path, help="optional savings-outcomes CSV for contract opportunity")
+    renewal_remind.add_argument("--output", type=Path, required=True, help="owner-assigned reminder CSV")
+    renewal_remind.add_argument("--alerts-output", type=Path, help="optional alert CSV accepted by the webhook delivery command")
+    renewal_remind.add_argument("--webhook-url", help="HTTPS webhook destination for deadline alerts")
+    renewal_remind.add_argument("--delivery-ledger", type=Path, default=Path("renewal-alert-deliveries.sqlite"))
+    renewal_remind.add_argument("--send", action="store_true", help="send alerts; otherwise webhook delivery is previewed")
 
     exceptions = subparsers.add_parser("exceptions", help="request, approve, and audit time-limited policy exceptions")
     exception_commands = exceptions.add_subparsers(dest="exceptions_command", required=True)
@@ -587,6 +612,15 @@ def build_parser() -> argparse.ArgumentParser:
     outcomes.add_argument("--contracts-ledger", type=Path, help="optional versioned contract evidence ledger")
     outcomes.add_argument("--renewals-ledger", type=Path, help="optional renewal decision ledger; requires contracts ledger")
     outcomes.add_argument("--output", type=Path, required=True)
+
+    attribution = subparsers.add_parser(
+        "savings-attribution", help="match invoice line items to reclaimed actions with confidence and price analysis",
+    )
+    attribution.add_argument("--actions", type=Path, required=True)
+    attribution.add_argument("--findings", type=Path, required=True)
+    attribution.add_argument("--baseline-invoice", type=Path, required=True)
+    attribution.add_argument("--current-invoice", type=Path, required=True)
+    attribution.add_argument("--output", type=Path, required=True)
 
     access_review = subparsers.add_parser(
         "access-review", help="assign finding reviews to owners and track due dates and decisions",
@@ -831,6 +865,35 @@ def _import_history(args: argparse.Namespace) -> int:
         print(f"Exported {len(rows)} provider import records to {args.output}.")
     else:
         sys.stdout.write(buffer.getvalue())
+    return 0
+
+
+def _import_snapshots(args: argparse.Namespace) -> int:
+    rows = list_import_snapshots(args.output_dir, args.provider)
+    output = StringIO()
+    fields = ("provider", "snapshot_version", "import_id", "source_timestamp", "valid", "published",
+              "validation_errors", "added_assignments", "removed_assignments", "changed_assignments")
+    writer = csv.DictWriter(output, fieldnames=fields)
+    writer.writeheader()
+    writer.writerows(rows)
+    if args.output:
+        _write_text(args.output, output.getvalue())
+    else:
+        sys.stdout.write(output.getvalue())
+    return 0
+
+
+def _import_diff(args: argparse.Namespace) -> int:
+    path = args.output_dir / "snapshots" / args.provider / f"{args.version:06d}" / "changes.csv"
+    if not path.is_file():
+        raise InputError(f"provider snapshot version {args.version} was not found for {args.provider}")
+    if args.output and args.output.resolve() == path.resolve():
+        raise InputError("import diff output cannot overwrite the snapshot source")
+    content = path.read_text(encoding="utf-8-sig")
+    if args.output:
+        _write_text(args.output, content)
+    else:
+        sys.stdout.write(content)
     return 0
 
 
@@ -1317,6 +1380,57 @@ def _renewals(args: argparse.Namespace) -> int:
         )
         print(f"Recorded budget {args.status} for {args.contract_id} version {args.version}.")
         return 0
+    if args.renewals_command == "remind":
+        if args.send and not args.webhook_url:
+            raise InputError("--send requires --webhook-url")
+        try:
+            windows = tuple(int(value.strip()) for value in args.windows.split(",") if value.strip())
+        except ValueError as exc:
+            raise InputError("--windows must be comma-separated positive day counts") from exc
+        if not windows or any(window < 1 for window in windows):
+            raise InputError("--windows must be comma-separated positive day counts")
+        if args.contracts.resolve() == args.ledger.resolve():
+            raise InputError("renewal workflow ledger must be separate from the contract evidence ledger")
+        potential: dict[str, str] = {}
+        if args.outcomes:
+            with args.outcomes.open("r", encoding="utf-8-sig", newline="") as handle:
+                reader = csv.DictReader(handle)
+                if not {"contract_id", "renewal_commitment_change_inr"}.issubset(reader.fieldnames or []):
+                    raise InputError("outcomes CSV must include contract_id and renewal_commitment_change_inr")
+                for row in reader:
+                    key = " ".join((row.get("contract_id") or "").casefold().split())
+                    try:
+                        amount = Decimal(row.get("renewal_commitment_change_inr") or "0")
+                    except InvalidOperation as exc:
+                        raise InputError("outcomes renewal commitment changes must be numeric") from exc
+                    if not amount.is_finite():
+                        raise InputError("outcomes renewal commitment changes must be finite")
+                    potential[key] = str(Decimal(potential.get(key, "0")) + amount)
+        potential = {contract_id: str(max(Decimal("0"), Decimal(amount)))
+                     for contract_id, amount in potential.items()}
+        outputs = {args.output.resolve(), args.contracts.resolve(), args.ledger.resolve()}
+        if args.outcomes:
+            outputs.add(args.outcomes.resolve())
+        if len(outputs) != 3 + int(args.outcomes is not None):
+            raise InputError("renewal reminder output cannot overwrite an input file")
+        alerts_path = args.alerts_output or args.output.with_name(args.output.stem + "-alerts.csv")
+        if alerts_path.resolve() in outputs:
+            raise InputError("renewal alerts output cannot overwrite an input file")
+        if alerts_path.resolve() == args.output.resolve():
+            raise InputError("renewal reminders and alert CSVs must use different output files")
+        create_renewal_campaign(args.contracts, args.ledger, as_of=args.as_of,
+                                horizon_days=max(windows), created_by="saas-sentry-reminder")
+        rows = build_renewal_reminders(args.ledger, as_of=args.as_of, windows=windows,
+                                       potential_savings=potential)
+        _write_text(args.output, format_renewal_reminders(rows))
+        _write_text(alerts_path, format_renewal_alerts(rows))
+        print(f"Generated {len(rows)} owner renewal reminders in {args.output} and alerts in {alerts_path}.")
+        if args.webhook_url:
+            pending, delivered = deliver_alerts(
+                alerts_path, args.delivery_ledger, webhook_url=args.webhook_url, send=args.send,
+            )
+            print(f"Renewal webhook alerts: {pending} pending, {delivered} delivered.")
+        return 0
     rows = list_renewals(args.ledger, as_of=args.as_of)
     content = format_renewals(rows)
     if args.output:
@@ -1437,6 +1551,18 @@ def _savings_outcomes(args: argparse.Namespace) -> int:
     )
     _write_text(args.output, format_savings_outcomes(rows))
     print(f"Wrote {len(rows)} savings outcomes for the invoice period to {args.output}.")
+    return 0
+
+
+def _savings_attribution(args: argparse.Namespace) -> int:
+    inputs = {args.actions.resolve(), args.findings.resolve(), args.baseline_invoice.resolve(),
+              args.current_invoice.resolve()}
+    if args.output.resolve() in inputs:
+        raise InputError("savings attribution output cannot overwrite an input file")
+    rows = attribute_savings(args.actions, args.findings, args.baseline_invoice, args.current_invoice)
+    _write_text(args.output, format_attributions(rows))
+    verified = sum(row.savings_verified for row in rows)
+    print(f"Wrote {len(rows)} action-level attributions ({verified} verified) to {args.output}.")
     return 0
 
 
@@ -1736,6 +1862,10 @@ def main() -> int:
             return _connect(args)
         if args.command == "import-history":
             return _import_history(args)
+        if args.command == "import-snapshots":
+            return _import_snapshots(args)
+        if args.command == "import-diff":
+            return _import_diff(args)
         if args.command == "focus":
             return _focus_import(args)
         if args.command == "reconcile":
@@ -1782,6 +1912,8 @@ def main() -> int:
             return _verify_savings(args)
         if args.command == "savings-outcomes":
             return _savings_outcomes(args)
+        if args.command == "savings-attribution":
+            return _savings_attribution(args)
         if args.command == "access-review":
             return _access_review(args)
         if args.command == "contract-model":

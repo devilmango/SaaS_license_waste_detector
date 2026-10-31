@@ -16,6 +16,7 @@ OUTPUT_FIELDS = (
     "vendor", "application", "contract_id", "invoice_id", "cost_center",
     "billing_period_start", "billing_period_end", "actual_billed_cost_inr",
     "source_currency", "owner", "renewal_date", "notice_days", "evidence_ref",
+    "line_item_id", "employee_id", "email", "sku", "quantity", "unit_price_inr",
 )
 
 _ALIASES = {
@@ -32,6 +33,12 @@ _ALIASES = {
     "renewal_date": ("renewal_date", "renewal date", "renewal", "expiration date", "expiry date"),
     "notice_days": ("notice_days", "notice days", "notice period days", "termination notice days"),
     "evidence_ref": ("evidence_ref", "evidence", "attachment url", "document url", "source document"),
+    "line_item_id": ("line_item_id", "line item id", "invoice line id", "line number"),
+    "employee_id": ("employee_id", "employee id", "user id", "assignee id"),
+    "email": ("email", "user email", "assignee email", "licensee email"),
+    "sku": ("sku", "sku part number", "product code", "license sku"),
+    "quantity": ("quantity", "qty", "seat quantity", "units"),
+    "unit_price_inr": ("unit_price_inr", "unit price inr", "unit price", "price per unit"),
 }
 
 _SYSTEM_FIELDS = {
@@ -43,21 +50,24 @@ _SYSTEM_FIELDS = {
         "invoice_id": "Invoice #", "cost_center": "Account", "billing_period_start": "Service Start Date",
         "billing_period_end": "Service End Date", "amount": "Line Total", "currency": "Currency",
         "owner": "Contract Owner", "renewal_date": "Renewal Date", "notice_days": "Notice Period Days",
-        "evidence_ref": "Attachment URL",
+        "evidence_ref": "Attachment URL", "line_item_id": "Line Item ID", "employee_id": "Employee ID",
+        "email": "Email", "sku": "SKU", "quantity": "Quantity", "unit_price_inr": "Unit Price INR",
     },
     "netsuite": {
         "vendor": "Vendor", "application": "Memo", "contract_id": "Contract ID",
         "invoice_id": "TranID", "cost_center": "Department", "billing_period_start": "Start Date",
         "billing_period_end": "End Date", "amount": "Amount", "currency": "Currency",
         "owner": "Contract Owner", "renewal_date": "Renewal Date", "notice_days": "Notice Days",
-        "evidence_ref": "Document URL",
+        "evidence_ref": "Document URL", "line_item_id": "Line Item ID", "employee_id": "Employee ID",
+        "email": "Email", "sku": "SKU", "quantity": "Quantity", "unit_price_inr": "Unit Price INR",
     },
     "ariba": {
         "vendor": "Supplier Name", "application": "Description", "contract_id": "Contract Number",
         "invoice_id": "Invoice Number", "cost_center": "Cost Center", "billing_period_start": "Service Period Start",
         "billing_period_end": "Service Period End", "amount": "Net Amount", "currency": "Currency Code",
         "owner": "Business Owner", "renewal_date": "Expiration Date", "notice_days": "Termination Notice Days",
-        "evidence_ref": "Source Document",
+        "evidence_ref": "Source Document", "line_item_id": "Line Item ID", "employee_id": "Employee ID",
+        "email": "Email", "sku": "SKU", "quantity": "Quantity", "unit_price_inr": "Unit Price INR",
     },
 }
 
@@ -139,6 +149,25 @@ def normalize_procurement_csv(
                     if notice_days < 0:
                         raise InputError(f"{input_path}:{line}: notice_days cannot be negative")
                     notice = str(notice_days)
+                if value["quantity"]:
+                    try:
+                        quantity = Decimal(value["quantity"].replace(",", ""))
+                    except InvalidOperation as exc:
+                        raise InputError(f"{input_path}:{line}: quantity must be numeric") from exc
+                    if not quantity.is_finite() or quantity < 0:
+                        raise InputError(f"{input_path}:{line}: quantity must be finite and non-negative")
+                    value["quantity"] = str(quantity)
+                if value["unit_price_inr"]:
+                    try:
+                        unit_price = Decimal(value["unit_price_inr"].replace(",", ""))
+                    except InvalidOperation as exc:
+                        raise InputError(f"{input_path}:{line}: unit_price_inr must be numeric") from exc
+                    if not unit_price.is_finite() or unit_price < 0:
+                        raise InputError(f"{input_path}:{line}: unit_price_inr must be finite and non-negative")
+                    source_unit_price_is_inr = _header_key(selected["unit_price_inr"] or "") == "unitpriceinr"
+                    converted_unit_price = (unit_price if source_unit_price_is_inr
+                                            else currency.convert(unit_price, code, input_path, line))
+                    value["unit_price_inr"] = f"{converted_unit_price.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):.2f}"
                 renewal = _date(value["renewal_date"], input_path, line, "renewal_date", required=False)
                 normalized.append({
                     "vendor": value["vendor"], "application": value["application"],
@@ -148,6 +177,9 @@ def normalize_procurement_csv(
                     "actual_billed_cost_inr": f"{amount_inr.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):.2f}",
                     "source_currency": code, "owner": value["owner"], "renewal_date": renewal,
                     "notice_days": notice, "evidence_ref": value["evidence_ref"],
+                    "line_item_id": value["line_item_id"], "employee_id": value["employee_id"],
+                    "email": value["email"], "sku": value["sku"], "quantity": value["quantity"],
+                    "unit_price_inr": value["unit_price_inr"],
                 })
             return tuple(normalized)
     except OSError as exc:

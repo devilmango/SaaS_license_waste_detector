@@ -50,6 +50,18 @@ class ProcurementImportTests(unittest.TestCase):
         ))
         self.assertEqual(rows[0]["actual_billed_cost_inr"], "800.00")
 
+    def test_preserves_line_item_identity_and_pricing_for_savings_attribution(self) -> None:
+        self.write(
+            ["vendor", "application", "contract_id", "invoice_id", "billing_period_start",
+             "billing_period_end", "amount", "currency", "cost_center", "Line Item ID",
+             "Employee ID", "Email", "SKU", "Quantity", "Unit Price INR"],
+            ["Vendor", "Chat", "chat-1", "INV-1", "2026-09-01", "2026-10-01", "100", "INR",
+             "ENG", "line-1", "E1", "owner@example.com", "sku-1", "2", "50"],
+        )
+        row, = normalize_procurement_csv(self.path)
+        self.assertEqual((row["line_item_id"], row["email"], row["quantity"], row["unit_price_inr"]),
+                         ("line-1", "owner@example.com", "2", "50.00"))
+
     def test_rejects_unknown_currency_or_reversed_invoice_period(self) -> None:
         self.write(
             ["vendor", "application", "contract_id", "invoice_id", "billing_period_start",

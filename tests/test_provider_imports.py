@@ -13,8 +13,8 @@ from unittest.mock import patch
 from urllib.error import HTTPError
 
 from saas_sentry.connectors import ConnectorError, _open_with_rate_limit
-from saas_sentry.cli import _import_history
-from saas_sentry.provider_imports import run_staged_import
+from saas_sentry.cli import _import_diff, _import_history, _import_snapshots
+from saas_sentry.provider_imports import list_import_snapshots, run_staged_import
 
 
 def write_exports(folder: Path, provider: str = "test") -> tuple[int, int]:
@@ -51,6 +51,54 @@ class ProviderImportSafetyTests(unittest.TestCase):
             history = list(csv.DictReader(handle))
         self.assertEqual(history[-1]["status"], "succeeded")
         self.assertEqual(history[-1]["assignment_count"], "1")
+        self.assertEqual(history[-1]["snapshot_version"], "1")
+        self.assertEqual(history[-1]["added_assignments"], "1")
+        snapshots = list_import_snapshots(self.output, "test")
+        self.assertEqual(snapshots[0]["valid"], "true")
+        self.assertEqual(snapshots[0]["published"], "true")
+
+    def test_second_snapshot_reports_changed_assignment(self) -> None:
+        run_staged_import("test", self.output, write_exports)
+
+        def changed(stage: Path):
+            write_exports(stage)
+            billing = stage / "billing.csv"
+            billing.write_text(billing.read_text().replace(",12000,", ",15000,"), encoding="utf-8")
+            return 1, 1
+
+        run_staged_import("test", self.output, changed)
+        snapshot = list_import_snapshots(self.output, "test")[-1]
+        self.assertEqual(snapshot["snapshot_version"], "2")
+        self.assertEqual(snapshot["changed_assignments"], "1")
+        diff_output = io.StringIO()
+        with redirect_stdout(diff_output):
+            self.assertEqual(_import_diff(Namespace(output_dir=self.output, provider="test", version=2, output=None)), 0)
+        self.assertIn("changed,u1,chat", diff_output.getvalue())
+        summary_output = io.StringIO()
+        with redirect_stdout(summary_output):
+            self.assertEqual(_import_snapshots(Namespace(output_dir=self.output, provider="test", output=None)), 0)
+        self.assertIn("changed_assignments", summary_output.getvalue())
+
+    def test_history_upgrade_preserves_older_import_rows(self) -> None:
+        (self.output / "import-history.csv").write_text(
+            "import_id,provider,started_at,finished_at,status,user_count,assignment_count,rate_limit_retries,error\n"
+            "legacy,test,2026-01-01T00:00:00Z,2026-01-01T00:00:01Z,succeeded,1,1,0,\n",
+            encoding="utf-8",
+        )
+        run_staged_import("test", self.output, write_exports)
+        with (self.output / "import-history.csv").open(encoding="utf-8", newline="") as handle:
+            history = list(csv.DictReader(handle))
+        self.assertEqual([row["import_id"] for row in history], ["legacy", history[1]["import_id"]])
+        self.assertEqual(history[0]["snapshot_version"], "")
+
+    def test_valid_snapshot_is_kept_with_unpublished_status_when_export_publish_fails(self) -> None:
+        with patch("saas_sentry.provider_imports._publish", side_effect=ConnectorError("disk error")):
+            with self.assertRaisesRegex(ConnectorError, "disk error"):
+                run_staged_import("test", self.output, write_exports)
+        snapshot, = list_import_snapshots(self.output, "test")
+        self.assertEqual(snapshot["valid"], "true")
+        self.assertEqual(snapshot["published"], "false")
+        self.assertEqual((self.output / "billing.csv").read_text(), "old billing\n")
 
     def test_failed_or_partial_import_keeps_previous_exports_and_records_failure(self) -> None:
         def incomplete(stage: Path):

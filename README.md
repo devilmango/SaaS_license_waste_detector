@@ -240,6 +240,13 @@ The pricing CSV requires `sku_part_number,annual_cost`; optional fields are `cur
 saas-sentry import-history --output-dir imports/m365
 ```
 
+Every validated refresh is also saved under `snapshots/<provider>/<version>/` with the validated CSVs, source timestamp, validation result, and a `changes.csv` assignment diff. Changes compare identity/application assignments and flag additions, removals, and changed billing attributes. Review snapshot history or inspect a version's diff:
+
+```bash
+saas-sentry import-snapshots --output-dir imports/m365 --provider microsoft365
+saas-sentry import-diff --output-dir imports/m365 --provider microsoft365 --version 2
+```
+
 Analyze the imported files with your HR roster:
 
 ```bash
@@ -576,6 +583,13 @@ saas-sentry savings-outcomes --actions actions.csv --findings findings.csv \
 
 The dashboard can show this table when started with `--outcomes-actions`, `--outcomes-findings`, `--invoice-baseline`, and `--invoice-current`; optional `--contracts-ledger` and `--renewals-ledger` add renewal evidence. These invoice deltas are observed app/cost-center changes and can include unrelated price, seat, credit, or usage changes; review them before treating them as savings caused by one recommendation.
 
+For action-level evidence, use `savings-attribution`. Normalized invoice inputs may carry optional `email`, `employee_id`, `invoice_id`, `line_item_id`, `contract_id`, `quantity`, and `unit_price_inr` columns. Identity matches are high confidence; contract matches are medium; application/cost-center-only matches are low confidence. Billing periods are prorated to a 365-day year. Quantity-based savings and unit-price movement are shown separately. The report keeps `invoice_reduction_observed` distinct from `savings_verified`; verification requires a high-confidence identity match and an annualized quantity reduction at least 80% of the action estimate, so a price cut by itself is not treated as a completed seat-reclaim outcome.
+
+```bash
+saas-sentry savings-attribution --actions actions.csv --findings findings.csv \
+  --baseline-invoice before.csv --current-invoice after.csv --output attribution.csv
+```
+
 ### Scheduled provider syncs
 
 Run provider import and analysis once with `--once`, or keep the process running with `--every-hours`. For a daily local wall-clock schedule, pass `--schedule-time HH:MM --timezone Area/City` using an IANA timezone. Scheduled sync and report cycles retry twice by default with capped exponential backoff; tune this with `--retries` and `--retry-delay`. Each output directory records the latest outcome in `schedule-health.json` and appends exhausted failures to `schedule-failures.csv`. Configure `--alerts-webhook-url` (or `SAAS_SENTRY_WEBHOOK_URL`) to preview failure alerts; add `--send-alerts` to deliver them. Scheduling runs in the foreground; use a process supervisor for persistent operation. Add both action and execution ledgers to verify completed reclaims after each fresh import:
@@ -744,6 +758,14 @@ saas-sentry renewals decide --ledger renewal-events.csv \
 saas-sentry renewals approve --ledger renewal-events.csv \
   --contract-id slack-enterprise --version 1 --status approved \
   --approved-by finance@example.com --evidence-ref evidence/budget-approval.pdf
+```
+
+Generate owner-assigned reminders as contracts enter the default 90-, 30-, and 7-day notice windows. The command creates missing campaigns, includes potential savings from an outcomes report when provided, and writes an alert CSV compatible with the existing webhook delivery flow. With `--webhook-url`, it previews delivery by default; add `--send` to deliver through the retrying, deduplicated webhook ledger. The alert includes the owner for routing by your webhook workflow.
+
+```bash
+saas-sentry renewals remind --contracts contract-events.csv \
+  --ledger renewal-events.csv --as-of 2026-10-01 --outcomes savings-outcomes.csv \
+  --output renewal-reminders.csv --webhook-url https://alerts.example.com/saas
 ```
 
 The exported audit report identifies pending owner decisions, overdue notice deadlines, pending budget approvals, and completed or rejected decisions. Campaign events retain the contract version, owner, dates, decision actors, notes, and evidence references. Creating a campaign is idempotent for a given contract version.

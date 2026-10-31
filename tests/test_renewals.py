@@ -14,6 +14,8 @@ from saas_sentry.renewals import (
     list_renewals,
     record_budget_approval,
     record_owner_decision,
+    build_renewal_reminders,
+    format_renewal_alerts,
 )
 
 
@@ -88,6 +90,25 @@ class RenewalWorkflowTests(unittest.TestCase):
             self.contracts, self.ledger, as_of=date(2026, 10, 1), horizon_days=0,
             created_by="finops@example.com",
         ), 0)
+
+    def test_deadline_reminder_is_owner_assigned_and_windowed(self) -> None:
+        self.create()
+        rows = build_renewal_reminders(
+            self.ledger, as_of=date(2026, 9, 2), windows=(90, 30, 7),
+            potential_savings={"slack-1": "4000.00"},
+        )
+        row, = rows
+        self.assertEqual((row.owner, row.days_until_deadline, row.window_days),
+                         ("owner@example.com", 0, 7))
+        self.assertEqual(row.potential_savings_inr, "4000.00")
+        self.assertIn("owner@example.com", format_renewal_alerts(rows))
+
+    def test_alert_payload_is_stable_inside_a_window_for_delivery_deduplication(self) -> None:
+        create_renewal_campaign(self.contracts, self.ledger, as_of=date(2026, 8, 1),
+                                horizon_days=60, created_by="finops@example.com")
+        first = build_renewal_reminders(self.ledger, as_of=date(2026, 8, 27))
+        next_day = build_renewal_reminders(self.ledger, as_of=date(2026, 8, 28))
+        self.assertEqual(format_renewal_alerts(first), format_renewal_alerts(next_day))
 
 
 if __name__ == "__main__":
