@@ -500,6 +500,42 @@ saas-sentry identity reconcile --hr examples/hr.csv --identities scim-identities
 
 The reconciliation flags terminated employees with active app access, active HR records that are deprovisioned, ambiguous identity matches, and directory users missing from HR. It writes a review report and does not change accounts or access.
 
+For a dashboard correction queue, start the dashboard with its identity files and a persistent correction ledger:
+
+```bash
+saas-sentry dashboard --hr examples/hr.csv --usage examples/usage.csv \
+  --billing examples/billing.csv --hr-identities examples/hr.csv \
+  --directory-identities scim-identities.csv \
+  --identity-corrections state/identity-corrections.csv
+```
+
+Reviewers can map a provider user to one exact HR employee or mark it as a shared account. Corrections are appended with reviewer, timestamp, and note, appear in dashboard history, and are applied by later reconciliation runs with `identity reconcile --mapping-rules state/identity-corrections.csv`. Shared identities are kept visible in reconciliation but excluded from person-level matching. The review route requires `review:write`; application-scoped principals only see and correct identities with app access inside their assigned scope.
+
+### Usage-based license tier optimization
+
+Provide a tier catalog with the maximum observed feature count each tier supports and annual per-seat pricing. Active billing rows need `license_tier`, and provider execution also needs `provider`, `provider_user_id`, and provider-specific tier IDs in the catalog.
+
+```csv
+application,tier,feature_capacity,annual_cost_inr,provider_tier_id
+Zoom,1,5,9000,1
+Zoom,2,20,18000,2
+```
+
+Generate recommendations and stage new proposals in an append-only action ledger:
+
+```bash
+saas-sentry tier-optimize --usage examples/tier-optimization-usage.csv \
+  --billing examples/tier-optimization-billing.csv --tiers examples/tier-catalog.csv \
+  --output tier-recommendations.csv --ledger tier-actions.csv --actor analyst@example.com
+saas-sentry tier-actions list --ledger tier-actions.csv
+saas-sentry tier-actions approve --ledger tier-actions.csv \
+  --action-id ACTION_ID --actor manager@example.com
+saas-sentry tier-actions execute --ledger tier-actions.csv \
+  --action-id ACTION_ID --actor operator@example.com
+```
+
+The estimate compares the active invoice annual cost with the recommended catalog price and only reports a downgrade when observed `features_used` fits the cheaper tier. Provider execution is currently implemented for Zoom Licensed (`2`) to Basic (`1`): it is blocked until approval, rechecks the live Zoom account type, applies the change, and reads the account again to verify it. Other provider/tier combinations remain recommendation and approval records until a verified provider downgrade operation is implemented. Execution failures remain in the action ledger and require operator investigation before a new action is staged.
+
 ### Monitoring anomalies and contract limits
 
 Compare a current JSON analysis report with a baseline to flag material spend or seat-count changes by cost center and contract. The monitor also flags contracts below their committed seat floor, reclaim candidates blocked by contract minimums, approaching notice deadlines, and any non-matching status in a reconciliation CSV.

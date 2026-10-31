@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from saas_sentry.connectors import ConnectorError
 from saas_sentry.identity import import_entra_identities, import_scim_identities, reconcile_identities
+from saas_sentry.identity_review import record_correction, review_queue
 
 
 class IdentityDirectoryTests(unittest.TestCase):
@@ -132,6 +133,37 @@ class IdentityDirectoryTests(unittest.TestCase):
         ]):
             with self.assertRaisesRegex(ConnectorError, "ended before all"):
                 import_scim_identities("https://id.example.com/scim/v2", self.root / "partial.csv", token="secret")
+
+    def test_reviewed_identity_correction_is_a_reusable_mapping_rule(self) -> None:
+        hr = self.root / "hr.csv"
+        hr.write_text("employee,employee_id,email,status\nAlice,E1,alice@example.com,active\n", encoding="utf-8")
+        identities = self.root / "identities.csv"
+        identities.write_text(
+            "employee_id,email,display_name,source,provider_user_id,active,app_access_json,provisioning_state\n"
+            "OLD,alice.old@example.com,Alice,scim,scim-1,true,[\"Slack\"],provisioned\n", encoding="utf-8",
+        )
+        ledger = self.root / "identity-corrections.csv"
+        queue = review_queue(hr, identities, ledger)
+        self.assertTrue(any(item["status"] == "identity_without_hr" for item in queue))
+        record_correction(hr, identities, ledger, identity_source="scim", provider_user_id="scim-1",
+                          decision="map", employee_id="E1", reviewed_by="reviewer@example.com")
+        result = reconcile_identities(hr, identities, mapping_rules_path=ledger)
+        self.assertEqual([row.match_status for row in result], ["active_match"])
+        self.assertEqual(review_queue(hr, identities, ledger), [])
+
+    def test_shared_account_correction_is_preserved_and_not_person_matched(self) -> None:
+        hr = self.root / "hr.csv"
+        hr.write_text("employee,employee_id,email,status\nShared,E1,team@example.com,active\n", encoding="utf-8")
+        identities = self.root / "identities.csv"
+        identities.write_text(
+            "employee_id,email,display_name,source,provider_user_id,active,app_access_json,provisioning_state\n"
+            ",team@example.com,Team,scim,shared-1,true,[\"Slack\"],provisioned\n", encoding="utf-8",
+        )
+        ledger = self.root / "identity-corrections.csv"
+        record_correction(hr, identities, ledger, identity_source="scim", provider_user_id="shared-1",
+                          decision="shared_account", reviewed_by="reviewer@example.com")
+        result = reconcile_identities(hr, identities, mapping_rules_path=ledger)
+        self.assertIn("shared_account", [row.match_status for row in result])
 
 
 if __name__ == "__main__":

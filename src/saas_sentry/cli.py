@@ -44,6 +44,10 @@ from .realization import build_realization_report, format_realization_report
 from .verification import format_invoice_verification, verify_invoice_savings
 from .reclaim_verification import format_verifications, verify_provider_reclaims
 from .identity import format_identity_matches, import_entra_identities, import_scim_identities, reconcile_identities
+from .tier_optimization import (
+    format_recommendations, list_tier_actions, recommend_downgrades, stage_recommendations,
+    transition_tier_action,
+)
 from .contracts import (
     approve_contract_version,
     format_contract_invoice_checks,
@@ -385,7 +389,26 @@ def build_parser() -> argparse.ArgumentParser:
     identity_reconcile = identity_commands.add_parser("reconcile", help="compare HR status with provider access and provisioning")
     identity_reconcile.add_argument("--hr", type=Path, required=True)
     identity_reconcile.add_argument("--identities", type=Path, required=True)
+    identity_reconcile.add_argument("--mapping-rules", type=Path, help="reviewed reusable provider-to-HR correction ledger")
     identity_reconcile.add_argument("--output", type=Path, required=True)
+
+    tier_optimize = subparsers.add_parser("tier-optimize", help="recommend lower license tiers from observed feature usage")
+    tier_optimize.add_argument("--usage", type=Path, required=True)
+    tier_optimize.add_argument("--billing", type=Path, required=True)
+    tier_optimize.add_argument("--tiers", type=Path, required=True, help="application,tier,feature_capacity,annual_cost_inr,provider_tier_id CSV")
+    tier_optimize.add_argument("--output", type=Path, required=True)
+    tier_optimize.add_argument("--ledger", type=Path, help="optionally stage recommendations in an approval ledger")
+    tier_optimize.add_argument("--actor", default="analyst", help="actor recorded when staging actions")
+
+    tier_actions = subparsers.add_parser("tier-actions", help="list, approve, reject, or execute tier downgrade actions")
+    tier_action_commands = tier_actions.add_subparsers(dest="tier_action_command", required=True)
+    tier_action_list = tier_action_commands.add_parser("list", help="show tier action state")
+    tier_action_list.add_argument("--ledger", type=Path, required=True)
+    for command in ("approve", "reject", "execute"):
+        action_parser = tier_action_commands.add_parser(command, help=f"{command} a proposed tier downgrade")
+        action_parser.add_argument("--ledger", type=Path, required=True)
+        action_parser.add_argument("--action-id", required=True)
+        action_parser.add_argument("--actor", required=True)
 
     contracts = subparsers.add_parser("contracts", help="version contract evidence, approve terms, and reconcile invoices")
     contract_commands = contracts.add_subparsers(dest="contracts_command", required=True)
@@ -579,6 +602,9 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard.add_argument("--invoice-current", type=Path, help="normalized invoice CSV for the later comparison period")
     dashboard.add_argument("--contracts-ledger", type=Path, help="versioned contract evidence ledger for renewal savings")
     dashboard.add_argument("--renewals-ledger", type=Path, help="renewal decision ledger for renewal context")
+    dashboard.add_argument("--hr-identities", type=Path, help="HR roster used by the identity match review queue")
+    dashboard.add_argument("--directory-identities", type=Path, help="canonical Entra/SCIM identities CSV for identity review")
+    dashboard.add_argument("--identity-corrections", type=Path, help="append-only corrections and reusable provider identity mapping rules")
     dashboard.add_argument("--exceptions", type=Path)
     dashboard.add_argument("--as-of", type=date.fromisoformat)
     dashboard.add_argument("--host", default="127.0.0.1", help="bind address; defaults to localhost")
@@ -1200,7 +1226,7 @@ def _identity(args: argparse.Namespace) -> int:
         return 0
     if args.output.resolve() in {args.hr.resolve(), args.identities.resolve()}:
         raise InputError("identity reconciliation output cannot overwrite an input")
-    rows = reconcile_identities(args.hr, args.identities)
+    rows = reconcile_identities(args.hr, args.identities, mapping_rules_path=args.mapping_rules)
     _write_text(args.output, format_identity_matches(rows))
     findings = sum(row.match_status in {
         "terminated_with_access", "terminated_active_account", "active_hr_deprovisioned",
@@ -1490,6 +1516,8 @@ def _dashboard(args: argparse.Namespace) -> int:
         "outcomes_actions": args.outcomes_actions, "outcomes_findings": args.outcomes_findings,
         "invoice_baseline": args.invoice_baseline, "invoice_current": args.invoice_current,
         "contracts_ledger": args.contracts_ledger, "renewals_ledger": args.renewals_ledger,
+        "hr_identities": args.hr_identities, "directory_identities": args.directory_identities,
+        "identity_corrections": args.identity_corrections,
     }
     users = load_dashboard_users(args.users_env)
     server = create_server(args.host, args.port, options, users=users)
@@ -1501,6 +1529,41 @@ def _dashboard(args: argparse.Namespace) -> int:
         print("Dashboard stopped.")
     finally:
         server.server_close()
+    return 0
+
+
+def _tier_optimize(args: argparse.Namespace) -> int:
+    inputs = {args.usage.resolve(), args.billing.resolve(), args.tiers.resolve()}
+    if args.output.resolve() in inputs:
+        raise InputError("tier recommendation output cannot overwrite an input")
+    rows = recommend_downgrades(args.usage, args.billing, args.tiers)
+    _write_text(args.output, format_recommendations(rows))
+    staged = stage_recommendations(rows, args.ledger, actor=args.actor) if args.ledger else 0
+    savings = sum((row.annual_savings_inr for row in rows), Decimal("0"))
+    print(f"Wrote {len(rows)} tier downgrade recommendations (₹{savings:.2f}/year); staged {staged} new actions.")
+    return 0
+
+
+def _tier_actions(args: argparse.Namespace) -> int:
+    if args.tier_action_command == "list":
+        rows = list_tier_actions(args.ledger)
+        output = StringIO()
+        fields = list(rows[0]) if rows else ["action_id", "status"]
+        writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+        sys.stdout.write(output.getvalue())
+        return 0
+    command = args.tier_action_command
+    if command == "execute":
+        result = transition_tier_action(
+            args.ledger, args.action_id, command, actor=args.actor,
+            operation=lambda state: ZoomConnector.from_environment().remove_user_license(
+                state["provider_user_id"], "2"),
+        )
+    else:
+        result = transition_tier_action(args.ledger, args.action_id, command, actor=args.actor)
+    print(f"Tier action {args.action_id}: {result['status']} ({result.get('result', '')})")
     return 0
 
 
@@ -1890,6 +1953,10 @@ def main() -> int:
             return _import_health(args)
         if args.command == "identity":
             return _identity(args)
+        if args.command == "tier-optimize":
+            return _tier_optimize(args)
+        if args.command == "tier-actions":
+            return _tier_actions(args)
         if args.command == "contracts":
             return _contracts(args)
         if args.command == "ledger":

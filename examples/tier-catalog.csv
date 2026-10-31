@@ -1,0 +1,3 @@
+application,tier,feature_capacity,annual_cost_inr,provider_tier_id
+Zoom,1,5,9000,1
+Zoom,2,20,18000,2

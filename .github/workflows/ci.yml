@@ -115,6 +115,10 @@ jobs:
             --changes examples/contract-changes.csv \
             --period-start 2026-09-01 --period-end 2026-10-01 \
             --config config.example.toml --output contract-period.csv
+          saas-sentry tier-optimize --usage examples/tier-optimization-usage.csv \
+            --billing examples/tier-optimization-billing.csv --tiers examples/tier-catalog.csv \
+            --output tier-recommendations.csv --ledger tier-actions.csv --actor ci@example.com
+          saas-sentry tier-actions list --ledger tier-actions.csv
           saas-sentry access-review create --findings findings.csv \
             --ledger access-review-events.csv --campaign-id ci-review \
             --due-on 2026-10-20 --created-by ci@example.com \
@@ -230,6 +234,10 @@ jobs:
           saas-sentry identity import-entra --help
           saas-sentry identity import-scim --help
           saas-sentry identity reconcile --help
+          saas-sentry tier-optimize --help
+          saas-sentry tier-actions --help
+          saas-sentry tier-actions approve --help
+          saas-sentry tier-actions execute --help
           saas-sentry contracts --help
           saas-sentry contracts record --help
           saas-sentry contracts approve --help

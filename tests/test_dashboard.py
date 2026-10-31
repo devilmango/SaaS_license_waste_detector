@@ -47,6 +47,7 @@ class DashboardTests(unittest.TestCase):
         self.assertIn(b"SaaS Sentry", html)
         self.assertIn(b"/api/report", html)
         self.assertIn(b"Action-level invoice attribution", html)
+        self.assertIn(b"Identity match review", html)
 
         status, content_type, body = self.get("/api/report")
         report = json.loads(body)
@@ -188,6 +189,38 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(result["outcomes"][0]["period"], "2026-09-01/2026-10-01")
         self.assertEqual(result["attributions"][0]["confidence"], "low")
         self.assertFalse(result["attributions"][0]["savings_verified"])
+
+    def test_identity_match_review_queue_records_reusable_dashboard_correction(self) -> None:
+        hr = self.root / "identity-hr.csv"
+        hr.write_text("employee,employee_id,email,status\nAlice,E1,alice@example.com,active\n", encoding="utf-8")
+        identities = self.root / "directory.csv"
+        identities.write_text(
+            "employee_id,email,display_name,source,provider_user_id,active,app_access_json,provisioning_state\n"
+            "OLD,alice.old@example.com,Alice,scim,scim-1,true,[\"Slack\"],provisioned\n", encoding="utf-8",
+        )
+        self.options.update({"hr_identities": hr, "directory_identities": identities,
+                             "identity_corrections": self.root / "identity-corrections.csv"})
+        reviewer = Principal("reviewer@example.com", "reviewer")
+        status, _, body = route_request("GET", "/api/identity-review", self.options, principal=reviewer)
+        self.assertEqual(status, 200, body)
+        queue = json.loads(body)["items"]
+        candidate = next(c for row in queue for c in row["candidates"])
+        out_of_scope = Principal("other@example.com", "reviewer", applications=("Notion",), restricted=True)
+        status, _, body = route_request("GET", "/api/identity-review", self.options, principal=out_of_scope)
+        self.assertEqual(json.loads(body)["items"], [])
+        denied_payload = json.dumps(candidate | {"decision": "map", "employee_id": "E1"}).encode()
+        self.assertEqual(route_request("POST", "/api/identity-review/correction", self.options,
+                                       principal=out_of_scope, body=denied_payload)[0], 403)
+        payload = json.dumps(candidate | {"decision": "map", "employee_id": "E1"}).encode()
+        status, _, body = route_request("POST", "/api/identity-review/correction", self.options,
+                                        principal=reviewer, body=payload)
+        self.assertEqual(status, 200, body)
+        self.assertEqual(json.loads(body)["correction"]["employee_id"], "E1")
+        status, _, body = route_request("GET", "/api/identity-review", self.options, principal=reviewer)
+        self.assertEqual(status, 200, body)
+        self.assertEqual(json.loads(body)["items"], [])
+        _, _, history = route_request("GET", "/api/identity-review", self.options, principal=reviewer)
+        self.assertEqual(len(json.loads(history)["corrections"]), 1)
 
 
 if __name__ == "__main__":

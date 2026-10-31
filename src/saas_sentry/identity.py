@@ -184,16 +184,22 @@ def import_scim_identities(base_url: str, output_path: Path, *, token: str | Non
     return len(rows)
 
 
-def reconcile_identities(hr_path: Path, identities_path: Path) -> tuple[IdentityMatch, ...]:
+def reconcile_identities(
+    hr_path: Path, identities_path: Path, *, mapping_rules_path: Path | None = None,
+) -> tuple[IdentityMatch, ...]:
     """Match directory records to HR by employee ID/email and flag access lifecycle gaps."""
     hr_rows = _rows(hr_path, {"employee_id", "email", "status"})
     identities = _rows(identities_path, {
         "employee_id", "email", "display_name", "source", "provider_user_id", "active",
         "app_access_json", "provisioning_state",
     })
+    if mapping_rules_path is not None:
+        from .identity_review import apply_mapping_rules
+        identities = apply_mapping_rules(identities, mapping_rules_path)
     if not hr_rows:
         raise InputError(f"{hr_path}: HR roster is empty")
     identity_by_index: dict[int, dict[str, str]] = {}
+    shared_accounts: list[dict[str, str]] = []
     for line, identity in enumerate(identities, start=2):
         if identity.get("active", "").casefold() not in {"true", "false"}:
             raise InputError(f"{identities_path}:{line}: active must be true or false")
@@ -203,7 +209,10 @@ def reconcile_identities(hr_path: Path, identities_path: Path) -> tuple[Identity
             raise InputError(f"{identities_path}:{line}: app_access_json must be a JSON array") from exc
         if not isinstance(apps, list) or any(not isinstance(app, str) for app in apps):
             raise InputError(f"{identities_path}:{line}: app_access_json must be a JSON string array")
-        identity_by_index[line - 2] = identity
+        if identity.get("_shared_account") == "true":
+            shared_accounts.append(identity)
+        else:
+            identity_by_index[line - 2] = identity
     used: set[int] = set()
     result: list[IdentityMatch] = []
     hr_keys: dict[int, tuple[set[str], set[str]]] = {}
@@ -283,6 +292,14 @@ def reconcile_identities(hr_path: Path, identities_path: Path) -> tuple[Identity
             "unknown", identity.get("source", ""), identity.get("provider_user_id", ""),
             identity.get("active", ""), ";".join(apps), identity.get("provisioning_state", ""),
             "identity_without_hr",
+        ))
+    for identity in shared_accounts:
+        apps = json.loads(identity["app_access_json"] or "[]")
+        result.append(IdentityMatch(
+            identity.get("employee_id", ""), identity.get("display_name", ""), identity.get("email", ""),
+            "unknown", identity.get("source", ""), identity.get("provider_user_id", ""),
+            identity.get("active", ""), ";".join(apps), identity.get("provisioning_state", ""),
+            "shared_account",
         ))
     return tuple(sorted(result, key=lambda item: (item.hr_status, item.employee.casefold(), item.email.casefold())))
 

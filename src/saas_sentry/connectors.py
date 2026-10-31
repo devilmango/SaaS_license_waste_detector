@@ -981,6 +981,9 @@ class ZoomConnector:
             url, token, "Zoom", self.HOSTS, method="PATCH",
             body=json.dumps({"type": 1}).encode("utf-8"),
         )
+        updated = _bearer_json(url, token, "Zoom", self.HOSTS)
+        if str(updated.get("id", "")) != user_id or updated.get("type") != 1:
+            raise ConnectorError("Zoom did not confirm the user downgrade to Basic")
         return "license_changed_to_basic"
 
 

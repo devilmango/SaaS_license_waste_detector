@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import patch
 
 from saas_sentry.connectors import (
+    ConnectorError,
     GitHubCopilotConnector,
     GoogleWorkspaceConnector,
     SlackConnector,
@@ -209,10 +210,11 @@ class ProviderConnectorTests(unittest.TestCase):
     def test_zoom_reclaim_rechecks_type_then_downgrades_to_basic(self) -> None:
         connector = ZoomConnector("account", "client", "secret")
         with patch.object(connector, "_token", return_value="token"), patch(
-            "saas_sentry.connectors._bearer_json", return_value={"id": "123", "type": 2},
+            "saas_sentry.connectors._bearer_json", side_effect=[{"id": "123", "type": 2}, {"id": "123", "type": 1}],
         ) as verify, patch("saas_sentry.connectors._bearer_mutation") as mutation:
             result = connector.remove_user_license("123", "2")
         self.assertEqual(result, "license_changed_to_basic")
+        self.assertEqual(verify.call_count, 2)
         self.assertIn("/users/123", verify.call_args.args[0])
         self.assertEqual(mutation.call_args.kwargs["method"], "PATCH")
         self.assertEqual(json.loads(mutation.call_args.kwargs["body"]), {"type": 1})
@@ -224,6 +226,14 @@ class ProviderConnectorTests(unittest.TestCase):
         ), patch("saas_sentry.connectors._bearer_mutation") as mutation:
             self.assertEqual(connector.remove_user_license("123", "2"), "user_already_basic")
         mutation.assert_not_called()
+
+    def test_zoom_downgrade_requires_provider_read_after_write_verification(self) -> None:
+        connector = ZoomConnector("account", "client", "secret")
+        with patch.object(connector, "_token", return_value="token"), patch(
+            "saas_sentry.connectors._bearer_json", side_effect=[{"id": "123", "type": 2}, {"id": "123", "type": 2}],
+        ), patch("saas_sentry.connectors._bearer_mutation"):
+            with self.assertRaisesRegex(ConnectorError, "did not confirm"):
+                connector.remove_user_license("123", "2")
 
 
 if __name__ == "__main__":
