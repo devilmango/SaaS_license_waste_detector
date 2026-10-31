@@ -81,6 +81,21 @@ jobs:
             --contracts examples/contract-entitlements.csv --output entitlements.csv
           saas-sentry notify --alerts anomalies.csv --ledger alert-deliveries.csv \
             --webhook-url https://example.invalid/webhook
+          finding_id=$(python -c 'import csv; print(next(row["finding_id"] for row in csv.DictReader(open("findings.csv", encoding="utf-8-sig")) if row["application"] == "Slack"))')
+          saas-sentry review set --file ci-savings-reviews.csv --finding-id "$finding_id" \
+            --status confirmed --owner finops@example.com --reviewed-on 2026-10-04
+          saas-sentry analyze --hr examples/hr.csv --usage examples/usage.csv \
+            --billing examples/billing.csv --contract-pricing examples/contract-pricing.csv \
+            --config config.example.toml --as-of 2026-10-04 \
+            --review-file ci-savings-reviews.csv --output-csv findings.csv
+          saas-sentry actions propose --findings findings.csv --file actions.csv \
+            --finding-id "$finding_id" --owner finops@example.com \
+            --proposed-by analyst@example.com --proposed-on 2026-10-04
+          action_id=$(python -c 'import csv; print(next(csv.DictReader(open("actions.csv", encoding="utf-8-sig"))) ["action_id"])')
+          saas-sentry actions approve --file actions.csv --action-id "$action_id" \
+            --approved-by manager@example.com --on 2026-10-04
+          saas-sentry actions reclaimed --file actions.csv --action-id "$action_id" \
+            --reclaimed-by operator@example.com --actual-annual-savings 12000 --on 2026-10-04
           saas-sentry import-health --hr examples/hr.csv --usage examples/usage.csv \
             --billing examples/billing.csv --output import-health.csv
           saas-sentry realization --actions actions.csv --findings findings.csv \
@@ -88,6 +103,9 @@ jobs:
           saas-sentry verify-savings --actions actions.csv --findings findings.csv \
             --baseline-invoice examples/savings-before.csv \
             --current-invoice examples/savings-after.csv --output invoice-verification.csv
+          saas-sentry savings-outcomes --actions actions.csv --findings findings.csv \
+            --baseline-invoice examples/savings-before.csv \
+            --current-invoice examples/savings-after.csv --output savings-outcomes.csv
           saas-sentry contract-model --billing examples/billing.csv \
             --contracts examples/contract-entitlements.csv \
             --contract-pricing examples/contract-pricing.csv \
@@ -112,6 +130,12 @@ jobs:
           saas-sentry ledger restore --backup audit-ledger-backup.sqlite \
             --database audit-ledger-restored.sqlite --preview
           saas-sentry alert-status --ledger alert-deliveries.csv
+          mkdir -p provider-import-history
+          cat > provider-import-history/import-history.csv <<'EOF'
+          import_id,provider,started_at,finished_at,status,user_count,assignment_count,rate_limit_retries,error
+          ci,zoom,2026-10-04T00:00:00Z,2026-10-04T00:00:01Z,succeeded,1,1,0,
+          EOF
+          saas-sentry import-history --output-dir provider-import-history
 
       - name: Validate procurement imports, seat reassignment, and renewal approvals
         run: |
@@ -171,6 +195,7 @@ jobs:
           saas-sentry connect slack --help
           saas-sentry connect github-copilot --help
           saas-sentry connect zoom --help
+          saas-sentry import-history --help
           saas-sentry actions --help
           saas-sentry actions execute --help
           saas-sentry actions resolve-execution --help

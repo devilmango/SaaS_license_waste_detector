@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from argparse import Namespace
+import csv
 from pathlib import Path
 import tempfile
 import json
@@ -85,8 +86,10 @@ class ScheduledSyncTests(unittest.TestCase):
             with patch("saas_sentry.cli.ZoomConnector.from_environment") as factory, patch(
                 "saas_sentry.cli._analyze", return_value=0,
             ) as analyze:
-                factory.return_value.import_exports.return_value = (3, 2)
-                self.assertEqual(_sync_once(args), (3, 2))
+                factory.return_value.import_exports.side_effect = lambda *args, **kwargs: self.write_staged_exports(
+                    *args, provider="zoom", **kwargs,
+                )
+                self.assertEqual(_sync_once(args), (2, 2))
             report_args = analyze.call_args.args[0]
             self.assertEqual(report_args.billing, root / "exports" / "billing.csv")
             self.assertEqual(report_args.usage, root / "exports" / "usage.csv")
@@ -105,13 +108,30 @@ class ScheduledSyncTests(unittest.TestCase):
             with patch("saas_sentry.cli.GoogleWorkspaceConnector.from_environment") as factory, patch(
                 "saas_sentry.cli._analyze", return_value=0,
             ), patch("saas_sentry.cli.verify_provider_reclaims", return_value=()) as verify:
-                factory.return_value.import_exports.return_value = (3, 2)
-                self.assertEqual(_sync_once(args), (3, 2))
+                factory.return_value.import_exports.side_effect = lambda *args, **kwargs: self.write_staged_exports(
+                    *args, provider="google_workspace", **kwargs,
+                )
+                self.assertEqual(_sync_once(args), (2, 2))
             verify.assert_called_once()
             self.assertIsNone(verify.call_args.args[2])
             self.assertEqual(verify.call_args.kwargs["provider"], "google_workspace")
             self.assertEqual(verify.call_args.args[3], root / "exports" / "billing.csv")
             self.assertEqual(verify.call_args.args[4], root / "exports" / "reclaim-verification-events.csv")
+
+    @staticmethod
+    def write_staged_exports(*args, provider, **_kwargs):
+        output = args[-1]
+        with (output / "usage.csv").open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["employee", "employee_id", "email", "application", "last_login", "usage_count", "active_days", "usage_window_days", "features_used"])
+            writer.writerows([[f"Person {i}", f"E{i}", f"person{i}@example.com", "Chat", "", "0", "0", "30", "0"] for i in range(2)])
+        with (output / "billing.csv").open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["employee_id", "email", "application", "license_status", "annual_cost", "currency", "contract_id", "renewal_date", "seat_minimum", "commitment_end_date", "notice_days", "bundle_group", "provider", "provider_user_id", "provider_license_id"])
+            writer.writerows([[f"E{i}", f"person{i}@example.com", "Chat", "active", "12000", "INR", "chat", "", "0", "", "0", "", provider, f"u{i}", "sku"] for i in range(2)])
+        (output / "import.json").write_text(json.dumps({"provider": provider, "user_count": 2,
+                                  "license_assignment_count": 2, "read_only": True}), encoding="utf-8")
+        return 2, 2
 
 
 if __name__ == "__main__":

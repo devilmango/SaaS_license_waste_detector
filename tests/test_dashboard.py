@@ -6,9 +6,11 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
+from decimal import Decimal
 
 from saas_sentry.dashboard import load_dashboard_users, route_request
 from saas_sentry.dashboard_auth import Principal
+from saas_sentry.actions import propose_action, transition_action
 
 
 class DashboardTests(unittest.TestCase):
@@ -148,6 +150,41 @@ class DashboardTests(unittest.TestCase):
             body=b'{"name":"Daily","schedule_time":"08:30","timezone":"UTC"}',
         )
         self.assertEqual(status, 403)
+
+    def test_dashboard_exposes_scoped_period_savings_outcomes(self) -> None:
+        findings = self.root / "outcome-findings.csv"
+        findings.write_text(
+            "finding_id,review_status,contract_adjusted_annual_opportunity_inr,application,contract_id,cost_center,review_owner\n"
+            "outcome-1,confirmed,12000,Slack,slack,ENG,owner@example.com\n", encoding="utf-8",
+        )
+        actions = self.root / "outcome-actions.csv"
+        action = propose_action(findings, actions, "outcome-1", owner="owner@example.com", proposed_by="analyst")
+        transition_action(actions, action, "approved", actor="manager")
+        transition_action(actions, action, "reclaimed", actor="operator",
+                          actual_annual_savings_inr=Decimal("10000"))
+        baseline = self.root / "outcome-baseline.csv"
+        baseline.write_text(
+            "application,cost_center,billing_period_start,billing_period_end,actual_billed_cost_inr\n"
+            "Slack,ENG,2026-08-01,2026-09-01,30000\n", encoding="utf-8",
+        )
+        current = self.root / "outcome-current.csv"
+        current.write_text(
+            "application,cost_center,billing_period_start,billing_period_end,actual_billed_cost_inr\n"
+            "Slack,ENG,2026-09-01,2026-10-01,20000\n", encoding="utf-8",
+        )
+        self.options.update({
+            "outcomes_actions": actions, "outcomes_findings": findings,
+            "invoice_baseline": baseline, "invoice_current": current,
+        })
+        status, _, body = route_request(
+            "GET", "/api/savings-outcomes", self.options,
+            principal=Principal("admin@example.com", "admin"),
+        )
+        result = json.loads(body)
+        self.assertEqual(status, 200)
+        self.assertTrue(result["configured"])
+        self.assertEqual(result["outcomes"][0]["owner"], "owner@example.com")
+        self.assertEqual(result["outcomes"][0]["period"], "2026-09-01/2026-10-01")
 
 
 if __name__ == "__main__":

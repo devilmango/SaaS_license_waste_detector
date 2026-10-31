@@ -34,6 +34,8 @@ from .connectors import (
     ZoomConnector,
     transfer_provider_license,
 )
+from .provider_imports import run_staged_import
+from .savings_outcomes import build_savings_outcomes, format_savings_outcomes
 from .alerts import deliver_alerts, list_delivery_records, retry_manual_alert
 from .entitlements import analyze_entitlements, format_entitlements
 from .import_health import build_import_health, format_import_health
@@ -198,6 +200,10 @@ def build_parser() -> argparse.ArgumentParser:
     zoom = connectors.add_parser("zoom", help="import active licensed Zoom users and last login times")
     zoom.add_argument("--pricing", type=Path, required=True, help="CSV mapping Zoom user_type to application and annual_cost")
     zoom.add_argument("--output-dir", type=Path, required=True)
+
+    import_history = subparsers.add_parser("import-history", help="inspect provider import results, failures, and rate-limit retries")
+    import_history.add_argument("--output-dir", type=Path, required=True, help="provider export directory containing import-history.csv")
+    import_history.add_argument("--output", type=Path, help="optional CSV export path")
 
     focus = subparsers.add_parser("focus", help="normalize FOCUS billing exports")
     focus_actions = focus.add_subparsers(dest="focus_command", required=True)
@@ -542,6 +548,12 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard.add_argument("--campaign-ledger", type=Path, help="append-only access review campaign ledger for dashboard campaigns")
     dashboard.add_argument("--schedule-db", type=Path, default=Path("state/saas-sentry.sqlite"), help="persistent schedule and history database")
     dashboard.add_argument("--schedule-output-dir", type=Path, default=Path("state/scheduled-reports"), help="directory for scheduled dashboard report JSON files")
+    dashboard.add_argument("--outcomes-actions", type=Path, help="reclaim action ledger for the savings outcomes dashboard panel")
+    dashboard.add_argument("--outcomes-findings", type=Path, help="findings CSV referenced by the reclaim action ledger")
+    dashboard.add_argument("--invoice-baseline", type=Path, help="normalized invoice CSV for the prior comparison period")
+    dashboard.add_argument("--invoice-current", type=Path, help="normalized invoice CSV for the later comparison period")
+    dashboard.add_argument("--contracts-ledger", type=Path, help="versioned contract evidence ledger for renewal savings")
+    dashboard.add_argument("--renewals-ledger", type=Path, help="renewal decision ledger for renewal context")
     dashboard.add_argument("--exceptions", type=Path)
     dashboard.add_argument("--as-of", type=date.fromisoformat)
     dashboard.add_argument("--host", default="127.0.0.1", help="bind address; defaults to localhost")
@@ -564,6 +576,17 @@ def build_parser() -> argparse.ArgumentParser:
     verify_savings.add_argument("--current-invoice", type=Path, required=True, help="normalized FOCUS CSV for later period")
     verify_savings.add_argument("--minimum-realization-percent", type=_money, default=Decimal("80"))
     verify_savings.add_argument("--output", type=Path, required=True)
+
+    outcomes = subparsers.add_parser(
+        "savings-outcomes", help="reconcile reclaim estimates with invoice periods and approved renewals",
+    )
+    outcomes.add_argument("--actions", type=Path, required=True)
+    outcomes.add_argument("--findings", type=Path, required=True)
+    outcomes.add_argument("--baseline-invoice", type=Path, required=True)
+    outcomes.add_argument("--current-invoice", type=Path, required=True)
+    outcomes.add_argument("--contracts-ledger", type=Path, help="optional versioned contract evidence ledger")
+    outcomes.add_argument("--renewals-ledger", type=Path, help="optional renewal decision ledger; requires contracts ledger")
+    outcomes.add_argument("--output", type=Path, required=True)
 
     access_review = subparsers.add_parser(
         "access-review", help="assign finding reviews to owners and track due dates and decisions",
@@ -752,29 +775,62 @@ def _review(args: argparse.Namespace) -> int:
 
 def _connect(args: argparse.Namespace) -> int:
     if args.provider == "microsoft365":
-        users, licenses = Microsoft365Connector.from_environment().import_exports(args.pricing, args.output_dir)
-        print(f"Imported {users} Microsoft 365 users and {licenses} license assignments into {args.output_dir}.")
-        print("The import is read-only; use the supplied HR CSV and run analyze on the generated exports.")
-        return 0
-    if args.provider == "google-workspace":
-        users, licenses = GoogleWorkspaceConnector.from_environment().import_exports(
-            args.pricing, args.output_dir, customer=args.customer,
+        operation = lambda stage: Microsoft365Connector.from_environment().import_exports(args.pricing, stage)
+        provider_name = "microsoft365"
+    elif args.provider == "google-workspace":
+        operation = lambda stage: GoogleWorkspaceConnector.from_environment().import_exports(
+            args.pricing, stage, customer=args.customer,
         )
+        provider_name = "google_workspace"
     elif args.provider == "slack":
-        users, licenses = SlackConnector.from_environment().import_exports(
-            args.pricing, args.output_dir, lookback_days=args.lookback_days,
+        operation = lambda stage: SlackConnector.from_environment().import_exports(
+            args.pricing, stage, lookback_days=args.lookback_days,
             as_of=args.as_of, team_id=args.team_id,
         )
+        provider_name = "slack"
     elif args.provider == "github-copilot":
-        users, licenses = GitHubCopilotConnector.from_environment().import_exports(
-            args.organization, args.pricing, args.identity_map, args.output_dir,
+        operation = lambda stage: GitHubCopilotConnector.from_environment().import_exports(
+            args.organization, args.pricing, args.identity_map, stage,
         )
+        provider_name = "github_copilot"
     elif args.provider == "zoom":
-        users, licenses = ZoomConnector.from_environment().import_exports(args.pricing, args.output_dir)
+        operation = lambda stage: ZoomConnector.from_environment().import_exports(args.pricing, stage)
+        provider_name = "zoom"
     else:
         return 2
+    users, licenses = run_staged_import(provider_name, args.output_dir, operation)
     print(f"Imported {users} provider users and {licenses} license assignments into {args.output_dir}.")
     print("Provider import requests are read-only; analyze the generated usage.csv and billing.csv with your HR roster.")
+    print(f"Import attempt recorded in {args.output_dir / 'import-history.csv'}.")
+    return 0
+
+
+def _import_history(args: argparse.Namespace) -> int:
+    path = args.output_dir / "import-history.csv"
+    if not path.exists():
+        raise InputError(f"no provider import history exists at {path}")
+    try:
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            required = {"import_id", "provider", "started_at", "finished_at", "status", "rate_limit_retries", "error"}
+            missing = required - set(reader.fieldnames or [])
+            if missing:
+                raise InputError(f"{path}: import history is missing columns: {', '.join(sorted(missing))}")
+            rows = list(reader)
+    except OSError as exc:
+        raise InputError(f"Cannot read provider import history {path}: {exc}") from exc
+    # Build output after the file handle closes so an export cannot truncate its source.
+    buffer = StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=reader.fieldnames)
+    writer.writeheader()
+    writer.writerows(rows)
+    if args.output:
+        if args.output.resolve() == path.resolve():
+            raise InputError("import history output cannot overwrite the source history")
+        _write_text(args.output, buffer.getvalue())
+        print(f"Exported {len(rows)} provider import records to {args.output}.")
+    else:
+        sys.stdout.write(buffer.getvalue())
     return 0
 
 
@@ -1317,6 +1373,9 @@ def _dashboard(args: argparse.Namespace) -> int:
         "review_file": args.review_file, "exceptions": args.exceptions, "as_of": args.as_of,
         "campaign_ledger": args.campaign_ledger,
         "schedule_db": args.schedule_db, "schedule_output_dir": args.schedule_output_dir,
+        "outcomes_actions": args.outcomes_actions, "outcomes_findings": args.outcomes_findings,
+        "invoice_baseline": args.invoice_baseline, "invoice_current": args.invoice_current,
+        "contracts_ledger": args.contracts_ledger, "renewals_ledger": args.renewals_ledger,
     }
     users = load_dashboard_users(args.users_env)
     server = create_server(args.host, args.port, options, users=users)
@@ -1363,6 +1422,21 @@ def _verify_savings(args: argparse.Namespace) -> int:
     _write_text(args.output, format_invoice_verification(rows))
     verified = sum(row.status == "verified" for row in rows)
     print(f"Wrote invoice verification for {len(rows)} reclaimed application/cost-center groups ({verified} verified).")
+    return 0
+
+
+def _savings_outcomes(args: argparse.Namespace) -> int:
+    inputs = {args.actions.resolve(), args.findings.resolve(), args.baseline_invoice.resolve(),
+              args.current_invoice.resolve()}
+    inputs.update(path.resolve() for path in (args.contracts_ledger, args.renewals_ledger) if path is not None)
+    if args.output.resolve() in inputs:
+        raise InputError("savings outcomes output cannot overwrite an input file")
+    rows = build_savings_outcomes(
+        args.actions, args.findings, args.baseline_invoice, args.current_invoice,
+        contracts_path=args.contracts_ledger, renewals_path=args.renewals_ledger,
+    )
+    _write_text(args.output, format_savings_outcomes(rows))
+    print(f"Wrote {len(rows)} savings outcomes for the invoice period to {args.output}.")
     return 0
 
 
@@ -1561,25 +1635,31 @@ def _watch(args: argparse.Namespace) -> int:
 def _sync_once(args: argparse.Namespace) -> tuple[int, int]:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     if args.provider == "microsoft365":
-        imported = Microsoft365Connector.from_environment().import_exports(args.pricing, args.output_dir)
+        provider_name = "microsoft365"
+        operation = lambda stage: Microsoft365Connector.from_environment().import_exports(args.pricing, stage)
     elif args.provider == "google-workspace":
-        imported = GoogleWorkspaceConnector.from_environment().import_exports(
-            args.pricing, args.output_dir, customer=args.customer,
+        provider_name = "google_workspace"
+        operation = lambda stage: GoogleWorkspaceConnector.from_environment().import_exports(
+            args.pricing, stage, customer=args.customer,
         )
     elif args.provider == "slack":
-        imported = SlackConnector.from_environment().import_exports(
-            args.pricing, args.output_dir, lookback_days=args.lookback_days, team_id=args.team_id,
+        provider_name = "slack"
+        operation = lambda stage: SlackConnector.from_environment().import_exports(
+            args.pricing, stage, lookback_days=args.lookback_days, team_id=args.team_id,
         )
     elif args.provider == "github-copilot":
         if not args.organization or not args.identity_map:
             raise InputError("github-copilot sync requires --organization and --identity-map")
-        imported = GitHubCopilotConnector.from_environment().import_exports(
-            args.organization, args.pricing, args.identity_map, args.output_dir,
+        provider_name = "github_copilot"
+        operation = lambda stage: GitHubCopilotConnector.from_environment().import_exports(
+            args.organization, args.pricing, args.identity_map, stage,
         )
     elif args.provider == "zoom":
-        imported = ZoomConnector.from_environment().import_exports(args.pricing, args.output_dir)
+        provider_name = "zoom"
+        operation = lambda stage: ZoomConnector.from_environment().import_exports(args.pricing, stage)
     else:
         raise InputError(f"unsupported sync provider {args.provider!r}")
+    imported = run_staged_import(provider_name, args.output_dir, operation)
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     report_dir = args.output_dir / "reports" / stamp
@@ -1654,6 +1734,8 @@ def main() -> int:
             return _review(args)
         if args.command == "connect":
             return _connect(args)
+        if args.command == "import-history":
+            return _import_history(args)
         if args.command == "focus":
             return _focus_import(args)
         if args.command == "reconcile":
@@ -1698,6 +1780,8 @@ def main() -> int:
             return _realization(args)
         if args.command == "verify-savings":
             return _verify_savings(args)
+        if args.command == "savings-outcomes":
+            return _savings_outcomes(args)
         if args.command == "access-review":
             return _access_review(args)
         if args.command == "contract-model":

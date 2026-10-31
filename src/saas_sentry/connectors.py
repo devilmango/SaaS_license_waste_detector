@@ -6,11 +6,13 @@ import csv
 import base64
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+from email.utils import parsedate_to_datetime
 import gzip
 import json
 import os
 from pathlib import Path
 import tempfile
+import time
 import uuid
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, quote, urlencode, urlparse
@@ -24,6 +26,46 @@ class ConnectorError(RuntimeError):
 GRAPH_ROOT = "https://graph.microsoft.com/v1.0"
 
 
+def _open_with_rate_limit(request, provider: str, *, timeout: int = 30, max_attempts: int = 4):
+    """Retry provider rate limits using Retry-After when supplied, otherwise back off."""
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least one")
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return urlopen(request, timeout=timeout)
+        except HTTPError as exc:
+            remaining = (exc.headers.get("X-RateLimit-Remaining", "") if exc.headers else "")
+            retryable = exc.code == 429 or (
+                exc.code == 403 and bool(exc.headers) and
+                (exc.headers.get("Retry-After") is not None or remaining == "0")
+            )
+            if exc.code == 403 and not retryable:
+                try:
+                    payload = json.loads(exc.read().decode("utf-8"))
+                    reasons = [entry.get("reason", "") for entry in payload.get("error", {}).get("errors", [])
+                               if isinstance(entry, dict)]
+                    retryable = any(reason.casefold() in {"ratelimitexceeded", "userratelimitexceeded"}
+                                    for reason in reasons)
+                except (OSError, UnicodeDecodeError, ValueError, AttributeError):
+                    retryable = False
+            if not retryable:
+                raise
+            if attempt >= max_attempts:
+                raise ConnectorError(f"{provider} API rate limit persisted after {attempt} attempts (HTTP {exc.code})") from exc
+            from .provider_imports import note_rate_limit_retry
+            note_rate_limit_retry()
+            retry_after = exc.headers.get("Retry-After", "") if exc.headers else ""
+            try:
+                delay = max(0.0, float(retry_after))
+            except ValueError:
+                try:
+                    retry_at = parsedate_to_datetime(retry_after)
+                    delay = max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
+                except (TypeError, ValueError, OverflowError):
+                    delay = float(2 ** (attempt - 1))
+            time.sleep(min(delay, 120.0))
+
+
 def _bearer_json(url: str, token: str, provider: str, allowed_hosts: set[str], *, headers: dict[str, str] | None = None) -> dict:
     parsed = urlparse(url)
     if parsed.scheme != "https" or parsed.hostname not in allowed_hosts:
@@ -31,7 +73,7 @@ def _bearer_json(url: str, token: str, provider: str, allowed_hosts: set[str], *
     request_headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
     request_headers.update(headers or {})
     try:
-        with urlopen(Request(url, headers=request_headers), timeout=30) as response:
+        with _open_with_rate_limit(Request(url, headers=request_headers), provider, timeout=30) as response:
             result = json.loads(response.read().decode("utf-8"))
     except HTTPError as exc:
         raise ConnectorError(f"{provider} API returned HTTP {exc.code}") from exc
@@ -47,7 +89,7 @@ def _bearer_bytes(url: str, token: str, provider: str, allowed_hosts: set[str]) 
     if parsed.scheme != "https" or parsed.hostname not in allowed_hosts:
         raise ConnectorError(f"{provider}: refused unexpected API URL")
     try:
-        with urlopen(Request(url, headers={"Authorization": f"Bearer {token}", "Accept": "application/gzip"}), timeout=60) as response:
+        with _open_with_rate_limit(Request(url, headers={"Authorization": f"Bearer {token}", "Accept": "application/gzip"}), provider, timeout=60) as response:
             return response.read()
     except HTTPError as exc:
         raise ConnectorError(f"{provider} API returned HTTP {exc.code}") from exc
@@ -205,7 +247,7 @@ class Microsoft365Connector:
     @staticmethod
     def _json_request(request: Request) -> dict:
         try:
-            with urlopen(request, timeout=30) as response:
+            with _open_with_rate_limit(request, "Microsoft 365", timeout=30) as response:
                 return json.loads(response.read().decode("utf-8"))
         except HTTPError as exc:
             message = f"HTTP {exc.code} from Microsoft identity/Graph endpoint"

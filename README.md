@@ -234,6 +234,12 @@ saas-sentry connect microsoft365 --pricing m365-pricing.csv --output-dir imports
 
 The pricing CSV requires `sku_part_number,annual_cost`; optional fields are `currency,contract_id,renewal_date,seat_minimum,commitment_end_date,notice_days,bundle_group`. Every assigned SKU must have a price mapping. The connector stops without writing outputs if sign-in activity is unavailable or any assigned SKU has no price.
 
+`connect` and each `sync` cycle build exports in a staging directory, validate both CSVs and their metadata, then publish the pair with the manifest last. If a request, data check, or publication fails, the previous canonical exports are restored. HTTP 429 and provider-specific rate-limit responses retry up to three times after the initial attempt, honoring `Retry-After` when available. Each attempt, including failures and retry count, is appended to `import-history.csv`:
+
+```bash
+saas-sentry import-history --output-dir imports/m365
+```
+
 Analyze the imported files with your HR roster:
 
 ```bash
@@ -556,6 +562,19 @@ saas-sentry verify-savings --actions actions.csv --findings findings.csv \
 ```
 
 The report includes baseline/current spend, modeled annual savings, annualized invoice reduction, variance, realization percentage, and a status. `verified` means the observed reduction meets the configured percentage; `partial`, `spend_increased`, and `no_reduction_observed` identify other outcomes. This is app/cost-center level evidence, not proof that a particular reclaim caused the entire invoice change: price changes, seat changes, credits, and unrelated usage can affect the same spend group. Review billing details before recording realized savings.
+
+### Unified savings outcomes
+
+`savings-outcomes` combines action estimates with the same two invoice periods and can add renewal decisions plus approved contract-version changes. Output is grouped by application, action owner, cost center, contract, and current invoice period. Invoice movement is normalized to 365 days and allocated across owners in proportion to reclaimed estimates; the renewal change compares the previous and current approved annual commitment and is split across applications in a shared contract.
+
+```bash
+saas-sentry savings-outcomes --actions actions.csv --findings findings.csv \
+  --baseline-invoice focus-before.csv --current-invoice focus-after.csv \
+  --contracts-ledger contract-events.csv --renewals-ledger renewal-events.csv \
+  --output savings-outcomes.csv
+```
+
+The dashboard can show this table when started with `--outcomes-actions`, `--outcomes-findings`, `--invoice-baseline`, and `--invoice-current`; optional `--contracts-ledger` and `--renewals-ledger` add renewal evidence. These invoice deltas are observed app/cost-center changes and can include unrelated price, seat, credit, or usage changes; review them before treating them as savings caused by one recommendation.
 
 ### Scheduled provider syncs
 
