@@ -12,7 +12,7 @@ import csv
 import tempfile
 import time
 from typing import Any
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 from http.cookies import SimpleCookie
 from threading import Event, RLock, Thread
 
@@ -27,7 +27,12 @@ from .schedules import create_schedule, list_schedules, run_due_schedules, run_s
 from .storage import _connect
 from .savings_outcomes import build_savings_outcomes
 from .savings_attribution import attribute_savings
-from .identity_review import list_corrections, record_correction, review_queue
+from .identity_review import (
+    list_corrections, list_mapping_rules, record_correction, record_deactivation, review_queue,
+)
+from .savings_attribution import attribute_tier_savings
+from .connectors import change_provider_license_tier
+from .tier_optimization import list_tier_action_history, list_tier_actions, transition_tier_action
 
 
 _HTML = """<!doctype html>
@@ -56,25 +61,29 @@ button,input{font:inherit}button{min-height:44px;background:var(--green);color:#
 <section class="panel"><h2>Access review campaigns</h2><form id="campaign-form"><label>Due date <input id="campaign-due" type="date" required></label> <label>Default owner <input id="campaign-owner" type="email" placeholder="Optional when each row has an owner"></label> <button type="submit">Create campaign</button></form><div class="table-wrap" style="margin-top:14px"><table><thead><tr><th>Campaign</th><th>Application</th><th>Finding</th><th>Owner</th><th>Due</th><th>Status</th><th>Decision</th></tr></thead><tbody id="campaigns"><tr><td class="empty" colspan="7">Loading…</td></tr></tbody></table></div></section>
 <section class="panel"><h2>Scheduled reports</h2><form id="schedule-form"><label>Name <input id="schedule-name" maxlength="100" required></label> <label>Local time <input id="schedule-time" type="time" required></label> <label>Timezone <input id="schedule-timezone" value="UTC" placeholder="Asia/Kolkata" required></label> <button type="submit">Create schedule</button></form><p class="foot">Schedules use the selected IANA timezone and run reports from the current dashboard data sources.</p><div class="table-wrap"><table><thead><tr><th>Name</th><th>Local schedule</th><th>Next run</th><th>Last result</th><th>Recent history</th><th>Actions</th></tr></thead><tbody id="schedules"><tr><td class="empty" colspan="6">Loading…</td></tr></tbody></table></div></section>
 <section class="panel"><h2>Savings outcomes</h2><p class="foot">Invoice changes are annualized over each billing period; renewal changes use approved contract versions.</p><div class="table-wrap"><table><thead><tr><th>Application</th><th>Owner</th><th>Period</th><th>Reclaimed estimate / year</th><th>Open estimate / year</th><th>Realized / year</th><th>Renewal change / year</th><th>Renewal status</th></tr></thead><tbody id="outcomes"><tr><td class="empty" colspan="8">Loading…</td></tr></tbody></table></div></section>
-<section class="panel"><h2>Action-level invoice attribution</h2><p class="foot">Observed invoice movement is separate from savings verified against an identity or line-item match.</p><div class="table-wrap"><table><thead><tr><th>Application</th><th>Owner</th><th>Action</th><th>Confidence</th><th>Observed reduction / year</th><th>Price change / year</th><th>Verified</th></tr></thead><tbody id="attributions"><tr><td class="empty" colspan="7">Loading…</td></tr></tbody></table></div></section>
-<section class="panel"><h2>Identity match review</h2><p class="foot">Corrections are recorded in an append-only ledger and reused during later HR-to-directory reconciliation. Shared accounts are excluded from person matching.</p><div class="table-wrap"><table><thead><tr><th>HR person</th><th>Issue</th><th>Provider identity</th><th>Correction</th><th>Decision</th></tr></thead><tbody id="identity-reviews"><tr><td class="empty" colspan="5">Loading…</td></tr></tbody></table></div><h3>Recent corrections</h3><div class="table-wrap"><table><thead><tr><th>Provider identity</th><th>Decision</th><th>HR target</th><th>Reviewer</th><th>Recorded</th><th>Note</th></tr></thead><tbody id="identity-correction-history"><tr><td class="empty" colspan="6">Loading…</td></tr></tbody></table></div></section>
+<section class="panel"><h2>Action-level invoice attribution</h2><p class="foot">Observed invoice movement is separate from savings verified against an identity or line-item match.</p><div class="table-wrap"><table><thead><tr><th>Application</th><th>Owner</th><th>Action</th><th>Confidence</th><th>Observed reduction / year</th><th>Price change / year</th><th>Verified</th></tr></thead><tbody id="attributions"><tr><td class="empty" colspan="7">Loading…</td></tr></tbody></table></div><h3>Tier downgrade savings</h3><p class="foot">Invoice evidence follows the provider downgrade. Renewal commitment changes are reported separately from invoice reductions.</p><div class="table-wrap"><table><thead><tr><th>Application / user</th><th>Tier change</th><th>Invoice period</th><th>Estimated / year</th><th>Observed reduction / year</th><th>Confidence</th><th>Renewal change / decision</th></tr></thead><tbody id="tier-savings"><tr><td class="empty" colspan="7">Loading…</td></tr></tbody></table></div></section>
+<section class="panel"><h2>License tier recommendations</h2><p class="foot">Review usage-window evidence, compatibility, contract timing, and annual price impact. Approval is separate from execution; execution is available to admins only and is verified against the provider.</p><div class="table-wrap"><table><thead><tr><th>Application / user</th><th>Tier change</th><th>Usage and compatibility evidence</th><th>Annual price comparison</th><th>Contract</th><th>Status / history</th><th>Review / execution</th></tr></thead><tbody id="tier-actions"><tr><td class="empty" colspan="7">Loading…</td></tr></tbody></table></div></section>
+<section class="panel"><h2>Identity match review</h2><p class="foot">Corrections are recorded in an append-only ledger and reused during later HR-to-directory reconciliation. Shared accounts are excluded from person matching.</p><div class="table-wrap"><table><thead><tr><th>HR person</th><th>Issue</th><th>Provider identity</th><th>Correction</th><th>Decision</th></tr></thead><tbody id="identity-reviews"><tr><td class="empty" colspan="5">Loading…</td></tr></tbody></table></div><h3>Saved identity mappings</h3><label for="identity-rule-search" class="label">Search provider, user, HR target, app, or conflict</label><p><input id="identity-rule-search" class="search" type="search" autocomplete="off" placeholder="Search identity mappings"></p><div class="table-wrap"><table><thead><tr><th>Provider identity</th><th>Saved mapping</th><th>Current directory record</th><th>Apps</th><th>Rule status</th><th>Admin actions</th></tr></thead><tbody id="identity-rules"><tr><td class="empty" colspan="6">Loading…</td></tr></tbody></table></div><h3>Correction audit history</h3><div class="table-wrap"><table><thead><tr><th>Provider identity</th><th>Decision</th><th>HR target</th><th>Reviewer</th><th>Recorded</th><th>Note</th></tr></thead><tbody id="identity-correction-history"><tr><td class="empty" colspan="6">Loading…</td></tr></tbody></table></div></section>
 <section class="panel"><h2>Renewal calendar</h2><div class="table-wrap"><table><thead><tr><th>Contract</th><th>Applications</th><th>Renewal</th><th>Notice deadline</th><th>Days to notice</th><th>Status</th></tr></thead><tbody id="renewals"><tr><td class="empty" colspan="6">Loading…</td></tr></tbody></table></div></section>
-<p class="foot">Analysis uses configured rules and active approved exceptions. Provider changes are not available here. Data is served by the local SaaS Sentry process.</p></main>
+<p class="foot">Analysis uses configured rules and active approved exceptions. Tier execution requires a provider-backed live check, independent approval, and admin permission. Data is served by the local SaaS Sentry process.</p></main>
 <script>
 const money=value=>new Intl.NumberFormat(undefined,{style:'currency',currency:'INR',maximumFractionDigits:0}).format(Number(value||0));
 const cell=(row,value,cls='')=>{const td=document.createElement('td');td.textContent=value??'';if(cls)td.className=cls;row.append(td);return td};let findingRows=[];
 function drawFindings(){const body=document.querySelector('#findings');body.replaceChildren();const query=document.querySelector('#search').value.trim().toLowerCase();const visible=findingRows.filter(f=>[f.application,f.employee,f.category,f.review?.status].join(' ').toLowerCase().includes(query));if(!visible.length){const row=body.insertRow();const td=cell(row,query?'No findings match this filter.':'No candidates found.');td.colSpan=8;td.className='empty';return}for(const f of visible){const row=body.insertRow();cell(row,f.application);cell(row,`${f.employee} · ${f.email}`);cell(row,f.category);cell(row,f.evidence);cell(row,money(f.opportunity_savings_inr));cell(row,f.review?.status||'unreviewed','status');const ownerCell=cell(row,'');const owner=document.createElement('input');owner.type='email';owner.placeholder='Use campaign default';owner.value=f.review?.owner||'';owner.setAttribute('aria-label',`Campaign owner for ${f.employee} ${f.application}`);owner.dataset.findingId=f.finding_id;ownerCell.append(owner);const action=cell(row,'');const select=document.createElement('select');select.setAttribute('aria-label',`Decision for ${f.employee} ${f.application}`);for(const value of ['confirmed','dismissed','deferred']){const option=document.createElement('option');option.value=value;option.textContent=value;select.append(option)}const button=document.createElement('button');button.type='button';button.textContent='Save';button.addEventListener('click',async()=>{button.disabled=true;try{await api('/api/reviews',{method:'POST',body:JSON.stringify({finding_id:f.finding_id,status:select.value,note:'Reviewed from dashboard'})});await refresh()}catch(error){const panel=document.querySelector('#error');panel.textContent=error.message;panel.hidden=false}finally{button.disabled=false}});action.append(select,button)}}
 function drawRenewals(rows){const body=document.querySelector('#renewals');body.replaceChildren();if(!rows.length){const row=body.insertRow();const td=cell(row,'No active contracts to display.');td.colSpan=6;td.className='empty';return}for(const r of rows){const row=body.insertRow();cell(row,r.contract_id);cell(row,r.applications);cell(row,r.renewal_date||'');cell(row,r.notice_deadline||'');cell(row,r.days_until_notice_deadline??'');cell(row,r.status,'status')}}
 async function drawOutcomes(){const body=document.querySelector('#outcomes');const attributionBody=document.querySelector('#attributions');body.replaceChildren();attributionBody.replaceChildren();try{const result=await api('/api/savings-outcomes');if(!result.configured||!result.outcomes.length){const row=body.insertRow();const td=cell(row,result.configured?'No savings outcomes to display.':'Configure outcome ledgers and invoice periods to show reconciled savings.');td.colSpan=8;td.className='empty'}else{for(const item of result.outcomes){const row=body.insertRow();cell(row,item.application);cell(row,item.owner);cell(row,item.period);cell(row,money(item.estimated_annual_savings_inr));cell(row,money(item.pending_estimated_savings_inr));cell(row,money(item.realized_annual_savings_inr));cell(row,money(item.renewal_commitment_change_inr));cell(row,`${item.renewal_decision||'—'} · ${item.renewal_status}`,'status')}}for(const item of (result.attributions||[])){const row=attributionBody.insertRow();cell(row,item.application);cell(row,item.owner);cell(row,item.action_id);cell(row,item.confidence,`status ${item.confidence}`);cell(row,money(item.observed_annualized_reduction_inr));cell(row,money(item.price_change_inr));cell(row,item.savings_verified?'Yes':'No')}}catch(error){for(const target of [body,attributionBody]){const row=target.insertRow();const td=cell(row,error.message);td.colSpan=target===body?8:7;td.className='empty'}}}
+async function drawTierActions(){const body=document.querySelector('#tier-actions');body.replaceChildren();try{const result=await api('/api/tier-actions');if(!result.configured){const tr=body.insertRow();const td=cell(tr,'Configure --tier-actions to enable dashboard tier reviews.');td.colSpan=7;td.className='empty';return}if(!result.actions.length){const tr=body.insertRow();const td=cell(tr,'No tier recommendations have been staged.');td.colSpan=7;td.className='empty';return}for(const item of result.actions){const tr=body.insertRow();cell(tr,`${item.application} · ${item.email}`);cell(tr,`${item.current_tier} → ${item.recommended_tier}`);cell(tr,`${item.compatibility_reason||'No compatibility explanation'}${item.evidence_status==='needs_telemetry'?' · TELEMETRY REQUIRED':''}`);cell(tr,`${money(item.annual_cost_current_inr)} → ${money(item.annual_cost_recommended_inr)} · save ${money(item.annual_savings_inr)}/yr`);cell(tr,[item.contract_id,item.contract_constraint,item.eligible_on?`Eligible ${item.eligible_on}`:''].filter(Boolean).join(' · ')||'No contract constraint recorded');const history=cell(tr,'');const details=document.createElement('details');const summary=document.createElement('summary');summary.textContent=`${item.status} · ${item.history.length} event(s)`;details.append(summary);for(const event of item.history){const line=document.createElement('div');line.textContent=`${event.event} · ${event.actor||event.proposed_by||''} · ${event.occurred_at||''}${event.result?` · ${event.result}`:''}`;details.append(line)}history.append(details);const actions=cell(tr,'');if(item.status==='proposed'){for(const decision of ['approved','rejected']){const button=document.createElement('button');button.textContent=decision==='approved'?'Approve':'Reject';button.addEventListener('click',async()=>{button.disabled=true;try{await api(`/api/tier-actions/${item.action_id}/${decision}`,{method:'POST',body:'{}'});await drawTierActions()}catch(error){showError(error)}finally{button.disabled=false}});actions.append(button)}}if(item.status==='approved'&&(!item.eligible_on||item.eligible_on<=new Date().toISOString().slice(0,10))){const button=document.createElement('button');button.textContent='Execute & verify';button.addEventListener('click',async()=>{button.disabled=true;try{await api(`/api/tier-actions/${item.action_id}/execute`,{method:'POST',body:'{}'});await drawTierActions()}catch(error){showError(error)}finally{button.disabled=false}});actions.append(button)}}}catch(error){const tr=body.insertRow();const td=cell(tr,error.message);td.colSpan=7;td.className='empty'}}
 async function drawIdentityReviews(){const body=document.querySelector('#identity-reviews');const historyBody=document.querySelector('#identity-correction-history');body.replaceChildren();historyBody.replaceChildren();try{const result=await api('/api/identity-review');const items=result.items;if(!result.configured){const tr=body.insertRow();const td=cell(tr,'Configure --hr-identities, --directory-identities, and --identity-corrections to enable identity review.');td.colSpan=5;td.className='empty';return}if(!items.length){const tr=body.insertRow();const td=cell(tr,'No ambiguous or conflicting identity matches.');td.colSpan=5;td.className='empty'}for(const item of items){const tr=body.insertRow();cell(tr,`${item.employee||'Unknown'} · ${item.email||'no HR email'}`);cell(tr,item.status,'status');const candidateCell=cell(tr,'');const select=document.createElement('select');select.setAttribute('aria-label',`Provider identity for ${item.employee||item.email}`);for(const candidate of item.candidates){const option=document.createElement('option');option.value=JSON.stringify(candidate);option.textContent=`${candidate.identity_source} · ${candidate.provider_user_id} · ${candidate.email}`;select.append(option)}candidateCell.append(select);const correction=cell(tr,'');const employeeId=document.createElement('input');employeeId.placeholder='HR employee ID';employeeId.value=item.employee_id||'';employeeId.setAttribute('aria-label','Canonical HR employee ID');const email=document.createElement('input');email.type='email';email.placeholder='Canonical HR email';email.value=item.email||'';email.setAttribute('aria-label','Canonical HR email');const note=document.createElement('input');note.placeholder='Review note (optional)';note.setAttribute('aria-label','Identity review note');correction.append(employeeId,email,note);const action=cell(tr,'');const decision=document.createElement('select');for(const value of ['map','shared_account']){const option=document.createElement('option');option.value=value;option.textContent=value==='map'?'Map to HR person':'Mark shared account';decision.append(option)}const button=document.createElement('button');button.type='button';button.textContent='Save correction';button.disabled=!item.candidates.length;button.addEventListener('click',async()=>{button.disabled=true;try{const target=JSON.parse(select.value||'{}');await api('/api/identity-review/correction',{method:'POST',body:JSON.stringify({...target,decision:decision.value,employee_id:employeeId.value,email:email.value,note:note.value})});await drawIdentityReviews()}catch(error){showError(error)}finally{button.disabled=false}});action.append(decision,button)}for(const item of result.corrections||[]){const tr=historyBody.insertRow();cell(tr,`${item.identity_source} · ${item.provider_user_id}`);cell(tr,item.decision);cell(tr,item.decision==='map'?`${item.employee_id} · ${item.email}`:'Shared account');cell(tr,item.reviewed_by);cell(tr,item.reviewed_at);cell(tr,item.note)}if(!(result.corrections||[]).length){const tr=historyBody.insertRow();const td=cell(tr,'No identity corrections recorded.');td.colSpan=6;td.className='empty'}}catch(error){const tr=body.insertRow();const td=cell(tr,error.message);td.colSpan=5;td.className='empty'}}
 async function api(path,options={}){let session={};try{const auth=await fetch('/api/session',{cache:'no-store'});if(auth.ok)session=await auth.json()}catch{}const response=await fetch(path,{...options,headers:{'Content-Type':'application/json','Authorization':`Bearer ${document.querySelector('#token').value}`,'X-CSRF-Token':session.csrf_token||'',...options.headers}});const result=await response.json();if(!response.ok)throw new Error(result.error||`HTTP ${response.status}`);return result}
+async function drawIdentityRules(){const body=document.querySelector('#identity-rules');body.replaceChildren();try{const result=await api('/api/identity-rules');const rules=result.rules||[];if(!rules.length){const tr=body.insertRow();const td=cell(tr,'No saved identity mappings.');td.colSpan=6;td.className='empty';return}for(const item of rules){const tr=body.insertRow();const provider=cell(tr,`${item.identity_source} · ${item.provider_user_id}`);const target=cell(tr,item.decision==='shared_account'?'Shared account':`${item.employee_id||''} · ${item.email||''}`);const current=cell(tr,`${item.directory_display_name||''} · ${item.directory_employee_id||''} · ${item.directory_email||''}`);cell(tr,(item.applications||[]).join(', ')||'No app access in directory');cell(tr,`${item.status}${item.conflict_reason?` · ${item.conflict_reason}`:''}`,item.conflict?'status conflict':'status');const controls=cell(tr,'');if(!item.can_manage){cell(controls,'Admin permission required');continue}const editor=document.createElement('div');const decision=document.createElement('select');for(const value of ['map','shared_account']){const option=document.createElement('option');option.value=value;option.textContent=value==='map'?'Map to HR person':'Mark shared account';decision.append(option)}decision.value=item.decision==='shared_account'?'shared_account':'map';const employee=document.createElement('input');employee.placeholder='HR employee ID';employee.value=item.decision==='map'?item.employee_id||'':'';employee.setAttribute('aria-label','Updated HR employee ID');const email=document.createElement('input');email.type='email';email.placeholder='HR email';email.value=item.decision==='map'?item.email||'':'';email.setAttribute('aria-label','Updated HR email');const note=document.createElement('input');note.placeholder='Reason (optional)';note.setAttribute('aria-label','Mapping change note');const save=document.createElement('button');save.textContent=item.active?'Save correction':'Reactivate / correct';save.addEventListener('click',async()=>{save.disabled=true;try{await api(`/api/identity-rules/${encodeURIComponent(item.identity_source)}/${encodeURIComponent(item.provider_user_id)}/correct`,{method:'POST',body:JSON.stringify({decision:decision.value,employee_id:employee.value,email:email.value,note:note.value})});await drawIdentityRules()}catch(error){showError(error)}finally{save.disabled=false}});editor.append(decision,employee,email,note,save);if(item.active){const deactivate=document.createElement('button');deactivate.textContent='Deactivate';deactivate.addEventListener('click',async()=>{deactivate.disabled=true;try{await api(`/api/identity-rules/${encodeURIComponent(item.identity_source)}/${encodeURIComponent(item.provider_user_id)}/deactivate`,{method:'POST',body:JSON.stringify({note:note.value})});await drawIdentityRules()}catch(error){showError(error)}finally{deactivate.disabled=false}});editor.append(deactivate)}controls.append(editor);provider.title=`Last reviewed ${item.reviewed_at}`;target.title=`Last reviewed by ${item.reviewed_by}`;current.title=`Directory snapshot ${item.directory_imported_at}`}}catch(error){const tr=body.insertRow();const td=cell(tr,error.message);td.colSpan=6;td.className='empty'}}
+async function drawTierSavings(){const body=document.querySelector('#tier-savings');body.replaceChildren();try{const result=await api('/api/tier-savings');if(!result.configured||!result.actions.length){const tr=body.insertRow();const td=cell(tr,result.configured?'No approved tier actions to reconcile yet.':'Configure --tier-actions and invoice period inputs to measure tier savings.');td.colSpan=7;td.className='empty';return}for(const item of result.actions){const tr=body.insertRow();cell(tr,`${item.application} · ${item.email}`);cell(tr,`${item.current_tier} → ${item.recommended_tier}`);cell(tr,item.period||item.status);cell(tr,money(item.estimated_annual_savings_inr));cell(tr,money(item.observed_annualized_reduction_inr));cell(tr,`${item.confidence}${item.confidence_reason?` · ${item.confidence_reason}`:''}`,`status ${item.confidence}`);cell(tr,`${money(item.renewal_commitment_change_inr)} · ${item.renewal_decision||item.renewal_status}`)}}catch(error){const tr=body.insertRow();const td=cell(tr,error.message);td.colSpan=7;td.className='empty'}}
 async function drawCampaigns(){const body=document.querySelector('#campaigns');body.replaceChildren();try{const rows=(await api('/api/campaigns')).campaigns;if(!rows.length){const tr=body.insertRow();const td=cell(tr,'No campaigns yet.');td.colSpan=7;td.className='empty';return}for(const item of rows){const tr=body.insertRow();cell(tr,item.campaign_id);cell(tr,item.application);cell(tr,item.finding_id);cell(tr,item.owner);cell(tr,item.due_on);cell(tr,item.status,'status');const td=cell(tr,'');if(item.status==='pending'||item.status==='overdue'){const select=document.createElement('select');for(const value of ['confirmed','dismissed','deferred']){const option=document.createElement('option');option.value=value;option.textContent=value;select.append(option)}const button=document.createElement('button');button.textContent='Decide';button.addEventListener('click',async()=>{button.disabled=true;try{await api('/api/campaigns/decision',{method:'POST',body:JSON.stringify({campaign_id:item.campaign_id,finding_id:item.finding_id,decision:select.value})});await refresh()}catch(error){const panel=document.querySelector('#error');panel.textContent=error.message;panel.hidden=false}finally{button.disabled=false}});td.append(select,button)}}}catch(error){body.innerHTML='';const tr=body.insertRow();const td=cell(tr,error.message);td.colSpan=7;td.className='empty'}}
 async function drawSchedules(){const body=document.querySelector('#schedules');body.replaceChildren();try{const schedules=(await api('/api/schedules')).schedules;if(!schedules.length){const tr=body.insertRow();const td=cell(tr,'No schedules configured.');td.colSpan=6;td.className='empty';return}for(const schedule of schedules){const tr=body.insertRow();const name=document.createElement('input');name.value=schedule.name;name.maxLength=100;name.setAttribute('aria-label','Schedule name');cell(tr,'').append(name);const time=document.createElement('input');time.type='time';time.value=schedule.schedule_time;time.setAttribute('aria-label','Local schedule time');const timezone=document.createElement('input');timezone.value=schedule.timezone;timezone.setAttribute('aria-label','Schedule timezone');const localCell=cell(tr,'');localCell.append(time,timezone);cell(tr,schedule.enabled?(schedule.next_run||''):'Paused');cell(tr,`${schedule.last_result}${schedule.last_error?`: ${schedule.last_error}`:''}`,'status');const history=cell(tr,'');const details=document.createElement('details');const summary=document.createElement('summary');summary.textContent=`${schedule.history.length} recent run(s)`;details.append(summary);for(const run of schedule.history){const item=document.createElement('div');item.textContent=`${run.started_at} · ${run.status} · ${run.attempts} attempt(s)${run.error?` · ${run.error}`:''}`;details.append(item)}history.append(details);const actions=cell(tr,'');const save=document.createElement('button');save.textContent='Save';save.addEventListener('click',async()=>{try{await api(`/api/schedules/${schedule.schedule_id}`,{method:'POST',body:JSON.stringify({name:name.value,schedule_time:time.value,timezone:timezone.value})});await drawSchedules()}catch(error){showError(error)}});const pause=document.createElement('button');pause.textContent=schedule.enabled?'Pause':'Resume';pause.addEventListener('click',async()=>{try{await api(`/api/schedules/${schedule.schedule_id}/pause`,{method:'POST',body:JSON.stringify({paused:schedule.enabled})});await drawSchedules()}catch(error){showError(error)}});const run=document.createElement('button');run.textContent='Run now';run.addEventListener('click',async()=>{run.disabled=true;try{await api(`/api/schedules/${schedule.schedule_id}/run`,{method:'POST'});await drawSchedules()}catch(error){showError(error)}finally{run.disabled=false}});actions.append(save,pause,run)}}catch(error){const tr=body.insertRow();const td=cell(tr,error.message);td.colSpan=6;td.className='empty'}}
 function showError(error){const panel=document.querySelector('#error');panel.textContent=error.message;panel.hidden=false}
-async function refresh(){const error=document.querySelector('#error');error.hidden=true;document.querySelector('#updated').textContent='Loading the latest analysis…';try{const response=await fetch('/api/report',{headers:{'Accept':'application/json','Authorization':`Bearer ${document.querySelector('#token').value}`},cache:'no-store'});if(!response.ok)throw new Error(response.status===401?'Enter a valid dashboard token':`Analysis returned HTTP ${response.status}`);const report=await response.json();document.querySelector('#licenses').textContent=report.scope_limited?report.findings.length:report.active_license_count;document.querySelector('.cards .card:first-child .label').textContent=report.scope_limited?'Visible findings':'Active licenses analyzed';document.querySelector('#opportunity').textContent=money(report.totals_inr.contract_adjusted_annual_opportunity);document.querySelector('#realizable').textContent=money(report.totals_inr.estimated_realizable_12m);findingRows=report.findings;document.querySelector('#finding-count').textContent=findingRows.length;drawFindings();drawRenewals(report.renewal_calendar);await drawCampaigns();await drawSchedules();await drawOutcomes();await drawIdentityReviews();document.querySelector('#updated').textContent=`As of ${report.as_of} · Updated ${new Date(report.generated_at).toLocaleString()}`}catch(err){document.querySelector('#updated').textContent='Could not load the report';error.textContent=err.message;error.hidden=false}}
+async function refresh(){const error=document.querySelector('#error');error.hidden=true;document.querySelector('#updated').textContent='Loading the latest analysis…';try{const response=await fetch('/api/report',{headers:{'Accept':'application/json','Authorization':`Bearer ${document.querySelector('#token').value}`},cache:'no-store'});if(!response.ok)throw new Error(response.status===401?'Enter a valid dashboard token':`Analysis returned HTTP ${response.status}`);const report=await response.json();document.querySelector('#licenses').textContent=report.scope_limited?report.findings.length:report.active_license_count;document.querySelector('.cards .card:first-child .label').textContent=report.scope_limited?'Visible findings':'Active licenses analyzed';document.querySelector('#opportunity').textContent=money(report.totals_inr.contract_adjusted_annual_opportunity);document.querySelector('#realizable').textContent=money(report.totals_inr.estimated_realizable_12m);findingRows=report.findings;document.querySelector('#finding-count').textContent=findingRows.length;drawFindings();drawRenewals(report.renewal_calendar);await drawCampaigns();await drawSchedules();await drawOutcomes();await drawTierSavings();await drawIdentityReviews();await drawIdentityRules();await drawTierActions();document.querySelector('#updated').textContent=`As of ${report.as_of} · Updated ${new Date(report.generated_at).toLocaleString()}`}catch(err){document.querySelector('#updated').textContent='Could not load the report';error.textContent=err.message;error.hidden=false}}
 document.querySelector('#campaign-form').addEventListener('submit',async event=>{event.preventDefault();try{const defaultOwner=document.querySelector('#campaign-owner').value;const assignments={};for(const input of document.querySelectorAll('#findings input[data-finding-id]'))assignments[input.dataset.findingId]=input.value.trim()||defaultOwner;await api('/api/campaigns',{method:'POST',body:JSON.stringify({due_on:document.querySelector('#campaign-due').value,default_owner:defaultOwner,assignments})});await refresh()}catch(error){const panel=document.querySelector('#error');panel.textContent=error.message;panel.hidden=false}});
 document.querySelector('#schedule-form').addEventListener('submit',async event=>{event.preventDefault();try{await api('/api/schedules',{method:'POST',body:JSON.stringify({name:document.querySelector('#schedule-name').value,schedule_time:document.querySelector('#schedule-time').value,timezone:document.querySelector('#schedule-timezone').value})});event.target.reset();document.querySelector('#schedule-timezone').value='UTC';await drawSchedules()}catch(error){showError(error)}});
-document.querySelector('#token').value=sessionStorage.getItem('saas-sentry-token')||'';document.querySelector('#token').addEventListener('change',e=>{sessionStorage.setItem('saas-sentry-token',e.target.value);refresh()});document.querySelector('#refresh').addEventListener('click',refresh);document.querySelector('#search').addEventListener('input',drawFindings);refresh();
+document.querySelector('#token').value=sessionStorage.getItem('saas-sentry-token')||'';document.querySelector('#token').addEventListener('change',e=>{sessionStorage.setItem('saas-sentry-token',e.target.value);refresh()});document.querySelector('#refresh').addEventListener('click',refresh);document.querySelector('#search').addEventListener('input',drawFindings);document.querySelector('#identity-rule-search').addEventListener('input',()=>{for(const row of document.querySelectorAll('#identity-rules tr'))row.hidden=!row.textContent.toLowerCase().includes(document.querySelector('#identity-rule-search').value.trim().toLowerCase())});refresh();
 </script></body></html>"""
 
 
@@ -132,6 +141,20 @@ def _dashboard_attributions(options: dict[str, Any]) -> list[dict[str, object]]:
         key: str(value) if isinstance(value, Decimal) else value
         for key, value in row.__dict__.items()
     } for row in attribute_savings(actions, findings, baseline, current)]
+
+
+def _dashboard_tier_savings(options: dict[str, Any]) -> list[dict[str, object]]:
+    actions = options.get("tier_actions")
+    baseline, current = options.get("invoice_baseline"), options.get("invoice_current")
+    if not all((actions, baseline, current)):
+        return []
+    return [{
+        key: value.isoformat() if isinstance(value, date) else str(value) if isinstance(value, Decimal) else value
+        for key, value in row.__dict__.items()
+    } for row in attribute_tier_savings(
+        actions, baseline, current, contracts_path=options.get("contracts_ledger"),
+        renewals_path=options.get("renewals_ledger"),
+    )]
 
 
 def _run_dashboard_schedule(report_options: dict[str, Any], schedule_id: str) -> dict[str, object] | None:
@@ -258,6 +281,39 @@ def route_request(method: str, target: str, report_options: dict[str, Any], *,
             return 403, "application/json; charset=utf-8", json.dumps({"error": str(exc)}).encode()
         except (ValueError, TypeError, AttributeError, json.JSONDecodeError) as exc:
             return 400, "application/json; charset=utf-8", json.dumps({"error": str(exc)}).encode()
+    if method == "POST" and route.path.startswith("/api/tier-actions/"):
+        try:
+            parts = route.path.strip("/").split("/")
+            if len(parts) != 4 or parts[:2] != ["api", "tier-actions"]:
+                return 404, "application/json; charset=utf-8", b'{"error":"tier action route not found"}'
+            ledger = report_options.get("tier_actions")
+            if ledger is None:
+                raise InputError("configure --tier-actions to review tier recommendations")
+            action_id, requested_event = parts[2], parts[3]
+            state = next((item for item in list_tier_actions(ledger) if item["action_id"] == action_id), None)
+            if state is None:
+                return 404, "application/json; charset=utf-8", b'{"error":"tier action not found"}'
+            if requested_event in {"approved", "rejected"}:
+                authorize(principal, "review:write", application=state.get("application", ""))
+            elif requested_event == "execute":
+                authorize(principal, "transfer:execute", application=state.get("application", ""))
+            else:
+                return 404, "application/json; charset=utf-8", b'{"error":"unsupported tier action event"}'
+            result = transition_tier_action(
+                ledger, action_id, requested_event, actor=principal.actor,
+                operation=lambda item: change_provider_license_tier(
+                    item["provider"], item["provider_user_id"], item.get("provider_license_id", ""),
+                    item["current_provider_tier_id"], item["recommended_provider_tier_id"],
+                ) if requested_event == "execute" else None,
+            )
+            history = list_tier_action_history(ledger).get(action_id, [])
+            return 200, "application/json; charset=utf-8", json.dumps(
+                {"action": result, "history": history}, ensure_ascii=False,
+            ).encode()
+        except AuthorizationError as exc:
+            return 403, "application/json; charset=utf-8", json.dumps({"error": str(exc)}).encode()
+        except (ValueError, TypeError, AttributeError, json.JSONDecodeError, InputError, OSError) as exc:
+            return 400, "application/json; charset=utf-8", json.dumps({"error": str(exc)}).encode()
     if method == "POST" and route.path == "/api/identity-review/correction":
         try:
             authorize(principal, "review:write", scope_required=False)
@@ -293,6 +349,49 @@ def route_request(method: str, target: str, report_options: dict[str, Any], *,
         except AuthorizationError as exc:
             return 403, "application/json; charset=utf-8", json.dumps({"error": str(exc)}).encode()
         except (ValueError, TypeError, json.JSONDecodeError, InputError, OSError) as exc:
+            return 400, "application/json; charset=utf-8", json.dumps({"error": str(exc)}).encode()
+    if method == "POST" and route.path.startswith("/api/identity-rules/"):
+        try:
+            parts = route.path.strip("/").split("/")
+            if len(parts) != 5 or parts[:2] != ["api", "identity-rules"]:
+                return 404, "application/json; charset=utf-8", b'{"error":"identity rule route not found"}'
+            hr_path, identities_path = report_options.get("hr_identities"), report_options.get("directory_identities")
+            ledger_path = report_options.get("identity_corrections")
+            if not hr_path or not identities_path or not ledger_path:
+                raise InputError("configure HR identities, directory identities, and --identity-corrections")
+            identity_source, provider_user_id, action = map(unquote, parts[2:])
+            rule = next((row for row in list_mapping_rules(hr_path, identities_path, ledger_path)
+                         if row["identity_source"].casefold() == identity_source.casefold()
+                         and row["provider_user_id"] == provider_user_id), None)
+            if rule is None:
+                return 404, "application/json; charset=utf-8", b'{"error":"saved identity mapping not found"}'
+            authorize(principal, "identity:manage", scope_required=False)
+            applications = rule.get("applications", [])
+            if principal.restricted and not applications:
+                raise AuthorizationError("Identity has no application scope to authorize this mapping change")
+            for application in applications:
+                authorize(principal, "identity:manage", application=application)
+            payload = json.loads(body or b"{}")
+            if not isinstance(payload, dict):
+                raise ValueError("identity rule request must be a JSON object")
+            if action == "correct":
+                event = record_correction(
+                    hr_path, identities_path, ledger_path, identity_source=identity_source,
+                    provider_user_id=provider_user_id, decision=str(payload.get("decision", "")),
+                    employee_id=str(payload.get("employee_id", "")), email=str(payload.get("email", "")),
+                    reviewed_by=principal.actor, note=str(payload.get("note", "")),
+                )
+            elif action == "deactivate":
+                event = record_deactivation(
+                    ledger_path, identity_source=identity_source, provider_user_id=provider_user_id,
+                    reviewed_by=principal.actor, note=str(payload.get("note", "")),
+                )
+            else:
+                return 404, "application/json; charset=utf-8", b'{"error":"unsupported identity rule action"}'
+            return 200, "application/json; charset=utf-8", json.dumps({"event": event}).encode()
+        except AuthorizationError as exc:
+            return 403, "application/json; charset=utf-8", json.dumps({"error": str(exc)}).encode()
+        except (ValueError, TypeError, AttributeError, json.JSONDecodeError, InputError, OSError) as exc:
             return 400, "application/json; charset=utf-8", json.dumps({"error": str(exc)}).encode()
     if method == "POST" and route.path in {"/api/campaigns", "/api/campaigns/decision"}:
         try:
@@ -431,6 +530,44 @@ def route_request(method: str, target: str, report_options: dict[str, Any], *,
                             continue
                 corrections = scoped_corrections
             payload = {"configured": True, "items": visible, "corrections": corrections}
+        elif route.path == "/api/identity-rules":
+            authorize(principal, "review:write", scope_required=False)
+            hr_path, identities_path = report_options.get("hr_identities"), report_options.get("directory_identities")
+            ledger_path = report_options.get("identity_corrections")
+            if not hr_path or not identities_path or not ledger_path:
+                raise InputError("configure HR identities, directory identities, and --identity-corrections to manage mappings")
+            visible_rules = []
+            for item in list_mapping_rules(hr_path, identities_path, ledger_path):
+                try:
+                    authorize(principal, "review:write", scope_required=False)
+                    if principal.restricted and not item["applications"]:
+                        continue
+                    for application in item["applications"]:
+                        authorize(principal, "review:write", application=application)
+                    try:
+                        authorize(principal, "identity:manage", scope_required=False)
+                        for application in item["applications"]:
+                            authorize(principal, "identity:manage", application=application)
+                        can_manage = not principal.restricted or bool(item["applications"])
+                    except AuthorizationError:
+                        can_manage = False
+                    visible_rules.append(item | {"can_manage": can_manage})
+                except AuthorizationError:
+                    continue
+            payload = {"rules": visible_rules}
+        elif route.path == "/api/tier-savings":
+            authorize(principal, "report:read", scope_required=False)
+            actions = _dashboard_tier_savings(report_options)
+            visible = []
+            for row in actions:
+                try:
+                    authorize(principal, "report:read", application=str(row.get("application", "")))
+                    visible.append(row)
+                except AuthorizationError:
+                    continue
+            payload = {"configured": bool(report_options.get("tier_actions")
+                         and report_options.get("invoice_baseline") and report_options.get("invoice_current")),
+                       "actions": visible}
         elif route.path == "/api/findings":
             report = scope_report(report, principal)
             query = parse_qs(route.query)
@@ -461,6 +598,21 @@ def route_request(method: str, target: str, report_options: dict[str, Any], *,
                     continue
             payload = {"configured": configured, "outcomes": visible,
                        "attributions": visible_attributions}
+        elif route.path == "/api/tier-actions":
+            authorize(principal, "report:read", scope_required=False)
+            ledger = report_options.get("tier_actions")
+            if ledger is None:
+                payload = {"configured": False, "actions": []}
+            else:
+                history = list_tier_action_history(ledger)
+                visible = []
+                for item in list_tier_actions(ledger):
+                    try:
+                        authorize(principal, "report:read", application=item.get("application", ""))
+                        visible.append(item | {"history": history.get(item["action_id"], [])})
+                    except AuthorizationError:
+                        continue
+                payload = {"configured": True, "actions": visible}
         elif route.path == "/api/health":
             payload = {"status": "ok", "as_of": report["as_of"],
                        "generated_at": report["generated_at"], "schema_version": report["schema_version"]}

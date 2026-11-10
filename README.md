@@ -511,15 +511,19 @@ saas-sentry dashboard --hr examples/hr.csv --usage examples/usage.csv \
 
 Reviewers can map a provider user to one exact HR employee or mark it as a shared account. Corrections are appended with reviewer, timestamp, and note, appear in dashboard history, and are applied by later reconciliation runs with `identity reconcile --mapping-rules state/identity-corrections.csv`. Shared identities are kept visible in reconciliation but excluded from person-level matching. The review route requires `review:write`; application-scoped principals only see and correct identities with app access inside their assigned scope.
 
+Administrators can manage saved mappings in the **Saved identity mappings** dashboard table. Search by provider, provider user ID, HR target, application, or conflict; correct a mapping, change it to a shared account, or deactivate it. Deactivation is an append-only audit event, so the previous decision remains in correction history and can be reactivated by saving a new correction. A newer directory snapshot is compared with each saved mapping; if the provider identity now resolves to another HR person, the dashboard marks the rule as a conflict and reconciliation skips that stale override until an administrator reviews it. Directory freshness uses the row's optional `imported_at` timestamp or, when absent, the directory CSV modification time. The dashboard grants mapping management to admins with `identity:manage`; scoped admins must also have access to the identity's application.
+
 ### Usage-based license tier optimization
 
-Provide a tier catalog with the maximum observed feature count each tier supports and annual per-seat pricing. Active billing rows need `license_tier`, and provider execution also needs `provider`, `provider_user_id`, and provider-specific tier IDs in the catalog.
+Provide a tier catalog with feature capacity, annual per-seat pricing, and provider tier IDs. Optional `supported_features`, `minimum_usage_window_days`, `minimum_active_days`, `max_active_days`, and `max_usage_count` columns express feature compatibility, minimum evidence volume, and low-activity thresholds for each tier. Usage exports may include `observed_features` (semicolon or comma separated), `active_days`, `usage_count`, and `usage_window_days`. The engine explains how observed features and activity fit the lower tier; candidates with missing or conflicting evidence are retained in the action ledger for dashboard visibility, but cannot be approved or executed until a fresh recommendation has sufficient evidence.
 
 ```csv
 application,tier,feature_capacity,annual_cost_inr,provider_tier_id
 Zoom,1,5,9000,1
 Zoom,2,20,18000,2
 ```
+
+For a feature-aware catalog, add `supported_features,minimum_usage_window_days,minimum_active_days,max_active_days,max_usage_count`, for example `Zoom,1,5,9000,1,chat;calendar,30,3,10,25`. An active billing row can add `provider_license_id`, `tier_change_allowed`, `tier_change_effective_date`, `commitment_end_date`, and `contract_id`. A prohibited change is marked `contract_blocked`; commitment/effective dates postpone execution until `eligible_on`. Pass `--as-of YYYY-MM-DD` to evaluate contract eligibility reproducibly.
 
 Generate recommendations and stage new proposals in an append-only action ledger:
 
@@ -534,7 +538,9 @@ saas-sentry tier-actions execute --ledger tier-actions.csv \
   --action-id ACTION_ID --actor operator@example.com
 ```
 
-The estimate compares the active invoice annual cost with the recommended catalog price and only reports a downgrade when observed `features_used` fits the cheaper tier. Provider execution is currently implemented for Zoom Licensed (`2`) to Basic (`1`): it is blocked until approval, rechecks the live Zoom account type, applies the change, and reads the account again to verify it. Other provider/tier combinations remain recommendation and approval records until a verified provider downgrade operation is implemented. Execution failures remain in the action ledger and require operator investigation before a new action is staged.
+The estimate compares active invoice annual cost with the recommended catalog price. Zoom Licensed (`2`) to Basic (`1`), Microsoft 365 direct SKU replacement, and Google Workspace same-product SKU reassignment have provider adapters. Each re-reads the imported user assignment immediately before the write and verifies the new tier from a fresh provider response. Microsoft 365 tier IDs are SKU UUIDs; the connector uses Graph [`assignLicense`](https://learn.microsoft.com/en-us/graph/api/user-assignlicense?view=graph-rest-1.0) and requires `LicenseAssignment.ReadWrite.All` with admin consent. Group-assigned licenses are refused. Google Workspace provider tier IDs and `provider_license_id` use JSON pairs such as `["Google-Apps","Business"]`; the replacement must have the same product ID. The connector updates the assignment with [License Manager `patch`](https://developers.google.com/workspace/admin/licensing/reference/rest/v1/licenseAssignments/patch), so its credential needs the appropriate licensing write scope. Other providers and tier changes are recommendations only until a safe adapter is available. Failed or interrupted executions remain in the append-only ledger for operator investigation.
+
+Review and execute actions in the dashboard by adding `--tier-actions tier-actions.csv` to the dashboard command below. Reviewers can inspect usage evidence, the cost comparison, contract limits, and event history, then approve or reject a proposal. Approval must come from a different actor than the proposer. Only admins with `transfer:execute` can execute; the panel records the provider result and verification event. CLI approval and execution remain available for automation.
 
 ### Monitoring anomalies and contract limits
 
@@ -625,6 +631,17 @@ For action-level evidence, use `savings-attribution`. Normalized invoice inputs 
 saas-sentry savings-attribution --actions actions.csv --findings findings.csv \
   --baseline-invoice before.csv --current-invoice after.csv --output attribution.csv
 ```
+
+Tier downgrade outcomes have their own action-level report. It follows approved actions through provider verification, matches later invoice rows to the user or tier/line item, prorates the observed reduction to a 365-day year, and keeps an observed invoice reduction distinct from verified savings. Confidence and match rationale are included; lower-confidence application or contract matches are never labeled verified. Optional approved contract versions and renewal decisions add commitment changes and owner decisions to the report.
+
+```bash
+saas-sentry tier-savings --actions tier-actions.csv \
+  --baseline-invoice invoice-before.csv --current-invoice invoice-after.csv \
+  --contracts-ledger contract-events.csv --renewals-ledger renewal-events.csv \
+  --output tier-savings.csv
+```
+
+The dashboard's **Tier downgrade savings** table uses the same `--tier-actions`, `--invoice-baseline`, and `--invoice-current` inputs. Add `--contracts-ledger` and `--renewals-ledger` to include renewal commitment changes and decisions. Approved but unexecuted actions remain visible as awaiting execution; invoice periods ending before provider verification are explicitly flagged.
 
 ### Scheduled provider syncs
 
@@ -815,6 +832,7 @@ saas-sentry dashboard --hr examples/hr.csv --usage examples/usage.csv \
   --billing examples/billing.csv --contract-pricing examples/contract-pricing.csv \
   --config config.example.toml --review-file reviews.csv \
   --exceptions exception-events.csv --campaign-ledger access-review-campaigns.csv \
+  --tier-actions tier-actions.csv \
   --host 127.0.0.1 --port 8765
 ```
 
@@ -826,7 +844,7 @@ saas-sentry dashboard --hr hr.csv --usage usage.csv --billing billing.csv \
   --review-file reviews.csv --host 127.0.0.1
 ```
 
-The browser keeps the bearer token in session storage. `viewer` can read reports and campaigns; `reviewer` can record decisions and create campaigns; `admin` also has transfer and policy capabilities. A user entry can add app/team scopes and explicit permissions:
+The browser keeps the bearer token in session storage. `viewer` can read reports and campaigns; `reviewer` can record decisions, create campaigns, and review tier recommendations; `admin` also has transfer execution and policy capabilities. Tier change execution requires the admin `transfer:execute` permission. A user entry can add app/team scopes and explicit permissions:
 
 ```bash
 export SAAS_SENTRY_DASHBOARD_USERS='[{"actor":"owner@example.com","role":"reviewer","token":"<at-least-24-random-characters>","applications":["Slack"],"teams":["Engineering"]}]'

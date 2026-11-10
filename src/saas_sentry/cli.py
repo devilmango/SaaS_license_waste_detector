@@ -27,6 +27,7 @@ from .review_notifications import deliver_review_reminders
 from .contract_model import format_contract_model, model_contract_period
 from .connectors import (
     ConnectorError,
+    change_provider_license_tier,
     GitHubCopilotConnector,
     GoogleWorkspaceConnector,
     Microsoft365Connector,
@@ -35,7 +36,9 @@ from .connectors import (
     transfer_provider_license,
 )
 from .provider_imports import list_import_snapshots, run_staged_import
-from .savings_attribution import attribute_savings, format_attributions
+from .savings_attribution import (
+    attribute_savings, attribute_tier_savings, format_attributions, format_tier_attributions,
+)
 from .savings_outcomes import build_savings_outcomes, format_savings_outcomes
 from .alerts import deliver_alerts, list_delivery_records, retry_manual_alert
 from .entitlements import analyze_entitlements, format_entitlements
@@ -399,6 +402,7 @@ def build_parser() -> argparse.ArgumentParser:
     tier_optimize.add_argument("--output", type=Path, required=True)
     tier_optimize.add_argument("--ledger", type=Path, help="optionally stage recommendations in an approval ledger")
     tier_optimize.add_argument("--actor", default="analyst", help="actor recorded when staging actions")
+    tier_optimize.add_argument("--as-of", type=date.fromisoformat, help="contract eligibility date (YYYY-MM-DD)")
 
     tier_actions = subparsers.add_parser("tier-actions", help="list, approve, reject, or execute tier downgrade actions")
     tier_action_commands = tier_actions.add_subparsers(dest="tier_action_command", required=True)
@@ -605,6 +609,7 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard.add_argument("--hr-identities", type=Path, help="HR roster used by the identity match review queue")
     dashboard.add_argument("--directory-identities", type=Path, help="canonical Entra/SCIM identities CSV for identity review")
     dashboard.add_argument("--identity-corrections", type=Path, help="append-only corrections and reusable provider identity mapping rules")
+    dashboard.add_argument("--tier-actions", type=Path, help="append-only tier approval, execution, and verification ledger")
     dashboard.add_argument("--exceptions", type=Path)
     dashboard.add_argument("--as-of", type=date.fromisoformat)
     dashboard.add_argument("--host", default="127.0.0.1", help="bind address; defaults to localhost")
@@ -647,6 +652,16 @@ def build_parser() -> argparse.ArgumentParser:
     attribution.add_argument("--baseline-invoice", type=Path, required=True)
     attribution.add_argument("--current-invoice", type=Path, required=True)
     attribution.add_argument("--output", type=Path, required=True)
+
+    tier_savings = subparsers.add_parser(
+        "tier-savings", help="reconcile approved tier downgrades with later invoices and renewals",
+    )
+    tier_savings.add_argument("--actions", type=Path, required=True, help="tier action event ledger")
+    tier_savings.add_argument("--baseline-invoice", type=Path, required=True)
+    tier_savings.add_argument("--current-invoice", type=Path, required=True)
+    tier_savings.add_argument("--contracts-ledger", type=Path, help="optional versioned contract ledger")
+    tier_savings.add_argument("--renewals-ledger", type=Path, help="optional renewal decision ledger")
+    tier_savings.add_argument("--output", type=Path, required=True)
 
     access_review = subparsers.add_parser(
         "access-review", help="assign finding reviews to owners and track due dates and decisions",
@@ -1518,6 +1533,7 @@ def _dashboard(args: argparse.Namespace) -> int:
         "contracts_ledger": args.contracts_ledger, "renewals_ledger": args.renewals_ledger,
         "hr_identities": args.hr_identities, "directory_identities": args.directory_identities,
         "identity_corrections": args.identity_corrections,
+        "tier_actions": args.tier_actions,
     }
     users = load_dashboard_users(args.users_env)
     server = create_server(args.host, args.port, options, users=users)
@@ -1536,7 +1552,7 @@ def _tier_optimize(args: argparse.Namespace) -> int:
     inputs = {args.usage.resolve(), args.billing.resolve(), args.tiers.resolve()}
     if args.output.resolve() in inputs:
         raise InputError("tier recommendation output cannot overwrite an input")
-    rows = recommend_downgrades(args.usage, args.billing, args.tiers)
+    rows = recommend_downgrades(args.usage, args.billing, args.tiers, as_of=args.as_of)
     _write_text(args.output, format_recommendations(rows))
     staged = stage_recommendations(rows, args.ledger, actor=args.actor) if args.ledger else 0
     savings = sum((row.annual_savings_inr for row in rows), Decimal("0"))
@@ -1555,11 +1571,15 @@ def _tier_actions(args: argparse.Namespace) -> int:
         sys.stdout.write(output.getvalue())
         return 0
     command = args.tier_action_command
+    if command == "reject":
+        command = "rejected"
     if command == "execute":
         result = transition_tier_action(
             args.ledger, args.action_id, command, actor=args.actor,
-            operation=lambda state: ZoomConnector.from_environment().remove_user_license(
-                state["provider_user_id"], "2"),
+            operation=lambda state: change_provider_license_tier(
+                state["provider"], state["provider_user_id"], state.get("provider_license_id", ""),
+                state["current_provider_tier_id"], state["recommended_provider_tier_id"],
+            ),
         )
     else:
         result = transition_tier_action(args.ledger, args.action_id, command, actor=args.actor)
@@ -1626,6 +1646,21 @@ def _savings_attribution(args: argparse.Namespace) -> int:
     _write_text(args.output, format_attributions(rows))
     verified = sum(row.savings_verified for row in rows)
     print(f"Wrote {len(rows)} action-level attributions ({verified} verified) to {args.output}.")
+    return 0
+
+
+def _tier_savings(args: argparse.Namespace) -> int:
+    inputs = {args.actions.resolve(), args.baseline_invoice.resolve(), args.current_invoice.resolve()}
+    inputs.update(path.resolve() for path in (args.contracts_ledger, args.renewals_ledger) if path is not None)
+    if args.output.resolve() in inputs:
+        raise InputError("tier savings output cannot overwrite an input file")
+    rows = attribute_tier_savings(
+        args.actions, args.baseline_invoice, args.current_invoice,
+        contracts_path=args.contracts_ledger, renewals_path=args.renewals_ledger,
+    )
+    _write_text(args.output, format_tier_attributions(rows))
+    verified = sum(row.savings_verified for row in rows)
+    print(f"Wrote {len(rows)} tier savings attributions ({verified} verified) to {args.output}.")
     return 0
 
 
@@ -1981,6 +2016,8 @@ def main() -> int:
             return _savings_outcomes(args)
         if args.command == "savings-attribution":
             return _savings_attribution(args)
+        if args.command == "tier-savings":
+            return _tier_savings(args)
         if args.command == "access-review":
             return _access_review(args)
         if args.command == "contract-model":

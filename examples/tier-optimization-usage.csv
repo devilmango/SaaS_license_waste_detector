@@ -1,2 +1,2 @@
-employee,email,application,features_used
-Alice Example,alice@example.com,Zoom,2
+employee,email,application,features_used,observed_features,usage_count,active_days,usage_window_days
+Alice Example,alice@example.com,Zoom,2,chat;calendar,18,8,30

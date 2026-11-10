@@ -109,6 +109,9 @@ jobs:
           saas-sentry savings-attribution --actions actions.csv --findings findings.csv \
             --baseline-invoice examples/savings-before.csv \
             --current-invoice examples/savings-after.csv --output savings-attribution.csv
+          saas-sentry tier-savings --actions tier-actions.csv \
+            --baseline-invoice examples/savings-before.csv \
+            --current-invoice examples/savings-after.csv --output tier-savings.csv
           saas-sentry contract-model --billing examples/billing.csv \
             --contracts examples/contract-entitlements.csv \
             --contract-pricing examples/contract-pricing.csv \
@@ -210,6 +213,7 @@ jobs:
           saas-sentry import-snapshots --help
           saas-sentry import-diff --help
           saas-sentry savings-attribution --help
+          saas-sentry tier-savings --help
           saas-sentry renewals remind --help
           saas-sentry actions --help
           saas-sentry actions execute --help

@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import csv
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Iterable
 
 from .actions import ActionError, list_actions
 from .engine import InputError
-from .savings_outcomes import _findings, _norm
+from .savings_outcomes import _findings, _norm, _renewal_changes
+from .tier_optimization import list_tier_actions
 
 
 @dataclass(frozen=True)
@@ -36,6 +37,29 @@ class SavingsAttribution:
     confidence_reason: str
     invoice_reduction_observed: bool
     savings_verified: bool
+
+
+@dataclass(frozen=True)
+class TierSavingsAttribution:
+    action_id: str
+    email: str
+    application: str
+    contract_id: str
+    current_tier: str
+    recommended_tier: str
+    period: str
+    estimated_annual_savings_inr: Decimal
+    observed_annualized_reduction_inr: Decimal
+    baseline_invoice_ids: str
+    current_invoice_ids: str
+    confidence: str
+    confidence_reason: str
+    invoice_reduction_observed: bool
+    savings_verified: bool
+    renewal_commitment_change_inr: Decimal
+    renewal_decision: str
+    renewal_status: str
+    status: str
 
 
 def _rows(path: Path) -> tuple[list[dict[str, str]], date, date]:
@@ -181,6 +205,141 @@ def attribute_savings(
     return tuple(output)
 
 
+def _tier_values(row: dict[str, str]) -> set[str]:
+    return {_norm(row.get(field, "")) for field in (
+        "tier", "license_tier", "sku", "sku_id", "provider_tier_id",
+    ) if row.get(field, "").strip()}
+
+
+def _select_tier_rows(rows: list[dict[str, str]], expected: set[str]) -> list[dict[str, str]]:
+    if not expected:
+        return rows
+    matched = [row for row in rows if _tier_values(row) & expected]
+    return matched or rows
+
+
+def attribute_tier_savings(
+    tier_actions_path: Path, baseline_invoice_path: Path, current_invoice_path: Path, *,
+    contracts_path: Path | None = None, renewals_path: Path | None = None,
+) -> tuple[TierSavingsAttribution, ...]:
+    """Compare approved/executed tier changes with later invoices and approved renewals."""
+    baseline, baseline_start, baseline_end = _rows(baseline_invoice_path)
+    current, current_start, current_end = _rows(current_invoice_path)
+    if baseline_end > current_start:
+        raise InputError("baseline invoice period must end on or before current invoice period starts")
+    if renewals_path is not None and contracts_path is None:
+        raise InputError("--renewals-ledger requires --contracts-ledger")
+    renewal_changes, renewal_statuses, latest_contract_versions = _renewal_changes(
+        contracts_path, renewals_path, baseline_end, current_end,
+    )
+    period = f"{current_start.isoformat()}/{current_end.isoformat()}"
+    old_days, new_days = Decimal((baseline_end - baseline_start).days), Decimal((current_end - current_start).days)
+    output: list[TierSavingsAttribution] = []
+    for action in list_tier_actions(tier_actions_path):
+        status = action.get("status", "")
+        if status not in {"approved", "verified"}:
+            continue
+        application = action.get("application", "")
+        contract_id = action.get("contract_id", "")
+        scoped = [row for row in baseline if _norm(row.get("application", "")) == _norm(application)]
+        scoped_current = [row for row in current if _norm(row.get("application", "")) == _norm(application)]
+        if contract_id:
+            old_contract = [row for row in scoped if _norm(row.get("contract_id", "")) == _norm(contract_id)]
+            new_contract = [row for row in scoped_current if _norm(row.get("contract_id", "")) == _norm(contract_id)]
+            if old_contract or new_contract:
+                scoped, scoped_current = old_contract, new_contract
+
+        confidence, reason = "none", "no matching invoice lines for this application or contract"
+        matched_old: list[dict[str, str]] = []
+        matched_new: list[dict[str, str]] = []
+        invoice_status = "awaiting_later_invoice"
+        if status == "approved":
+            invoice_status = "awaiting_execution"
+        else:
+            try:
+                verified_at = datetime.fromisoformat(action.get("occurred_at", "").replace("Z", "+00:00"))
+                verified_on = verified_at.date()
+            except ValueError:
+                verified_on = None
+            if verified_on and current_end <= verified_on:
+                invoice_status = "invoice_predates_downgrade"
+                reason = "current invoice period ended before provider verification"
+            else:
+                email = _norm(action.get("email", ""))
+                old_identity = [row for row in scoped if email and _norm(row.get("email", "")) == email]
+                new_identity = [row for row in scoped_current if email and _norm(row.get("email", "")) == email]
+                old_expected = {_norm(action.get("current_tier", "")),
+                                _norm(action.get("current_provider_tier_id", "")),
+                                _norm(action.get("provider_license_id", ""))} - {""}
+                new_expected = {_norm(action.get("recommended_tier", "")),
+                                _norm(action.get("recommended_provider_tier_id", ""))} - {""}
+                if old_identity and new_identity:
+                    matched_old = _select_tier_rows(old_identity, old_expected)
+                    matched_new = _select_tier_rows(new_identity, new_expected)
+                    confidence = "high"
+                    reason = "invoice lines matched to the downgraded user identity"
+                    if len(matched_old) != 1 or len(matched_new) != 1:
+                        confidence, reason = "medium", "identity matched, but multiple invoice lines remain"
+                else:
+                    old_sku = [row for row in scoped if _tier_values(row) & old_expected]
+                    new_sku = [row for row in scoped_current if _tier_values(row) & new_expected]
+                    if len(old_sku) == 1 and len(new_sku) == 1:
+                        matched_old, matched_new = old_sku, new_sku
+                        confidence, reason = "medium", "unique old and replacement tiers matched within the application and contract"
+                    else:
+                        old_line_ids = {row.get("line_item_id", "") for row in scoped if row.get("line_item_id")}
+                        new_line_ids = {row.get("line_item_id", "") for row in scoped_current if row.get("line_item_id")}
+                        shared = old_line_ids & new_line_ids
+                        if len(shared) == 1:
+                            line_id = next(iter(shared))
+                            matched_old = [row for row in scoped if row.get("line_item_id") == line_id]
+                            matched_new = [row for row in scoped_current if row.get("line_item_id") == line_id]
+                            confidence, reason = "high", "matched by one stable invoice line-item ID"
+                        elif scoped and scoped_current:
+                            matched_old, matched_new = scoped, scoped_current
+                            confidence, reason = "low", "only application and contract scope matched; unrelated invoice changes may be included"
+
+                if matched_old and matched_new:
+                    before = _amount(matched_old) / old_days * Decimal("365")
+                    after = _amount(matched_new) / new_days * Decimal("365")
+                    observed = (before - after).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                    invoice_status = "invoice_reconciled" if confidence in {"high", "medium"} else "low_confidence_match"
+                else:
+                    observed = Decimal("0.00")
+                    invoice_status = "no_invoice_match"
+
+        if status == "approved" or invoice_status in {"invoice_predates_downgrade", "awaiting_later_invoice", "no_invoice_match"}:
+            observed = Decimal("0.00")
+        reduction = observed > 0
+        estimate = Decimal(action.get("annual_savings_inr", "0") or "0")
+        verified = reduction and confidence == "high" and observed >= estimate * Decimal("0.8")
+        renewal_change = Decimal("0.00")
+        decision, renewal_status = "", "not_provided" if renewals_path is None else "no_campaign"
+        contract_key = _norm(contract_id)
+        renewal_record = renewal_changes.get(contract_key)
+        if status == "verified" and renewal_record:
+            change, applications, version = renewal_record
+            if not applications or _norm(application) in {_norm(value) for value in applications}:
+                renewal_change = change
+            renewal_version = version or latest_contract_versions.get(contract_key, 0)
+            decision, renewal_status = renewal_statuses.get(
+                (contract_key, renewal_version), ("", "no_campaign" if renewals_path else "not_provided"),
+            )
+        elif contracts_path is not None:
+            renewal_status = "no_change_recorded"
+        output.append(TierSavingsAttribution(
+            action["action_id"], action.get("email", ""), application, contract_id,
+            action.get("current_tier", ""), action.get("recommended_tier", ""), period,
+            estimate.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), observed,
+            ";".join(sorted({row.get("invoice_id", "") for row in matched_old if row.get("invoice_id")})),
+            ";".join(sorted({row.get("invoice_id", "") for row in matched_new if row.get("invoice_id")})),
+            confidence, reason, reduction, verified,
+            renewal_change.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), decision,
+            renewal_status, invoice_status,
+        ))
+    return tuple(output)
+
+
 def format_attributions(rows: Iterable[SavingsAttribution]) -> str:
     from io import StringIO
     fields = tuple(SavingsAttribution.__dataclass_fields__)
@@ -191,6 +350,23 @@ def format_attributions(rows: Iterable[SavingsAttribution]) -> str:
         values = {field: getattr(row, field) for field in fields}
         for field in ("baseline_amount_inr", "current_amount_inr", "observed_annualized_reduction_inr",
                       "quantity_savings_inr", "price_change_inr", "estimated_annual_savings_inr"):
+            values[field] = f"{values[field]:.2f}"
+        for field in ("invoice_reduction_observed", "savings_verified"):
+            values[field] = str(values[field]).lower()
+        writer.writerow(values)
+    return output.getvalue()
+
+
+def format_tier_attributions(rows: Iterable[TierSavingsAttribution]) -> str:
+    from io import StringIO
+    fields = tuple(TierSavingsAttribution.__dataclass_fields__)
+    output = StringIO()
+    writer = csv.DictWriter(output, fieldnames=fields)
+    writer.writeheader()
+    for row in rows:
+        values = {field: getattr(row, field) for field in fields}
+        for field in ("estimated_annual_savings_inr", "observed_annualized_reduction_inr",
+                      "renewal_commitment_change_inr"):
             values[field] = f"{values[field]:.2f}"
         for field in ("invoice_reduction_observed", "savings_verified"):
             values[field] = str(values[field]).lower()

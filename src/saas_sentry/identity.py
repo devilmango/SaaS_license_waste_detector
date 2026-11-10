@@ -194,8 +194,13 @@ def reconcile_identities(
         "app_access_json", "provisioning_state",
     })
     if mapping_rules_path is not None:
-        from .identity_review import apply_mapping_rules
-        identities = apply_mapping_rules(identities, mapping_rules_path)
+        from .identity_review import apply_mapping_rules, list_mapping_rules
+        conflicted = {
+            (row["identity_source"].casefold(), row["provider_user_id"])
+            for row in list_mapping_rules(hr_path, identities_path, mapping_rules_path)
+            if row["conflict"]
+        }
+        identities = apply_mapping_rules(identities, mapping_rules_path, conflicted=conflicted)
     if not hr_rows:
         raise InputError(f"{hr_path}: HR roster is empty")
     identity_by_index: dict[int, dict[str, str]] = {}

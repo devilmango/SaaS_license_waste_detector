@@ -1,2 +1,2 @@
-email,application,license_status,annual_cost,license_tier,provider,provider_user_id
-alice@example.com,Zoom,active,18000,2,zoom,zoom-user-1
+email,application,license_status,annual_cost,license_tier,provider,provider_user_id,provider_license_id,contract_id,tier_change_allowed
+alice@example.com,Zoom,active,18000,2,zoom,zoom-user-1,2,zoom-annual,true

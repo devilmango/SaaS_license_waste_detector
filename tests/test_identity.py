@@ -9,7 +9,9 @@ from unittest.mock import patch
 
 from saas_sentry.connectors import ConnectorError
 from saas_sentry.identity import import_entra_identities, import_scim_identities, reconcile_identities
-from saas_sentry.identity_review import record_correction, review_queue
+from saas_sentry.identity_review import (
+    list_mapping_rules, record_correction, record_deactivation, review_queue,
+)
 
 
 class IdentityDirectoryTests(unittest.TestCase):
@@ -164,6 +166,41 @@ class IdentityDirectoryTests(unittest.TestCase):
                           decision="shared_account", reviewed_by="reviewer@example.com")
         result = reconcile_identities(hr, identities, mapping_rules_path=ledger)
         self.assertIn("shared_account", [row.match_status for row in result])
+
+    def test_newer_directory_import_conflict_is_reported_and_stale_rule_is_not_applied(self) -> None:
+        hr = self.root / "hr.csv"
+        hr.write_text(
+            "employee,employee_id,email,status\nAlice,E1,alice@example.com,active\n"
+            "Bob,E2,bob@example.com,active\n", encoding="utf-8",
+        )
+        identities = self.root / "directory.csv"
+        identities.write_text(
+            "employee_id,email,display_name,source,provider_user_id,active,app_access_json,provisioning_state\n"
+            "OLD,alice.old@example.com,Alice,scim,scim-1,true,[\"Slack\"],provisioned\n", encoding="utf-8",
+        )
+        ledger = self.root / "identity-corrections.csv"
+        record_correction(hr, identities, ledger, identity_source="scim", provider_user_id="scim-1",
+                          decision="map", employee_id="E1", reviewed_by="admin@example.com")
+
+        # A later directory refresh now identifies this provider user as Bob.
+        identities.write_text(
+            "employee_id,email,display_name,source,provider_user_id,active,app_access_json,provisioning_state\n"
+            "E2,bob@example.com,Bob,scim,scim-1,true,[\"Slack\"],provisioned\n", encoding="utf-8",
+        )
+        rule, = list_mapping_rules(hr, identities, ledger)
+        self.assertTrue(rule["conflict"])
+        self.assertEqual(rule["status"], "conflict")
+        self.assertIn("newer directory import", rule["conflict_reason"])
+        matches = reconcile_identities(hr, identities, mapping_rules_path=ledger)
+        self.assertEqual({row.employee_id: row.match_status for row in matches}["E2"], "active_match")
+
+        record_deactivation(ledger, identity_source="scim", provider_user_id="scim-1",
+                            reviewed_by="admin@example.com", note="Retire stale manual override")
+        inactive, = list_mapping_rules(hr, identities, ledger)
+        self.assertFalse(inactive["active"])
+        self.assertEqual(inactive["status"], "deactivated")
+        self.assertEqual(reconcile_identities(hr, identities, mapping_rules_path=ledger)[1].match_status,
+                         "active_match")
 
 
 if __name__ == "__main__":

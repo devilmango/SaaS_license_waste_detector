@@ -12,6 +12,8 @@ from saas_sentry.contracts import approve_contract_version, record_contract_vers
 from saas_sentry.renewals import create_renewal_campaign, record_owner_decision
 from saas_sentry.savings_outcomes import build_savings_outcomes, format_savings_outcomes
 from saas_sentry.savings_attribution import attribute_savings, format_attributions
+from saas_sentry.savings_attribution import attribute_tier_savings, format_tier_attributions
+from saas_sentry.tier_optimization import recommend_downgrades, stage_recommendations, transition_tier_action
 
 
 class SavingsOutcomeTests(unittest.TestCase):
@@ -133,6 +135,72 @@ class SavingsOutcomeTests(unittest.TestCase):
         self.assertGreater(row.price_change_inr, Decimal("0"))
         self.assertTrue(row.invoice_reduction_observed)
         self.assertFalse(row.savings_verified)
+
+    def test_tier_downgrade_savings_link_to_later_invoice_and_renewal_decision(self) -> None:
+        usage = self.root / "tier-usage.csv"
+        usage.write_text(
+            "employee,email,application,features_used\nAlice,alice@example.com,Zoom,2\n", encoding="utf-8",
+        )
+        billing = self.root / "tier-billing.csv"
+        billing.write_text(
+            "email,application,license_status,annual_cost,license_tier,provider,provider_user_id,contract_id\n"
+            "alice@example.com,Zoom,active,12000,2,zoom,user-1,zoom-contract\n", encoding="utf-8",
+        )
+        catalog = self.root / "tier-catalog.csv"
+        catalog.write_text(
+            "application,tier,feature_capacity,annual_cost_inr,provider_tier_id\n"
+            "Zoom,1,5,6000,1\nZoom,2,20,12000,2\n", encoding="utf-8",
+        )
+        actions = self.root / "tier-actions.csv"
+        recommendation, = recommend_downgrades(usage, billing, catalog)
+        stage_recommendations([recommendation], actions, actor="analyst")
+        transition_tier_action(actions, recommendation.action_id, "approved", actor="manager")
+        transition_tier_action(actions, recommendation.action_id, "execute", actor="operator",
+                               operation=lambda _state: "license_changed_to_basic")
+
+        fields = ["application", "cost_center", "billing_period_start", "billing_period_end",
+                  "actual_billed_cost_inr", "email", "invoice_id", "line_item_id", "sku_id", "contract_id"]
+        for path, period_start, period_end, amount, sku, invoice_id in (
+            (self.baseline, "2026-12-01", "2027-01-01", "1000", "2", "inv-before"),
+            (self.current, "2027-01-01", "2027-02-01", "500", "1", "inv-after"),
+        ):
+            with path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fields)
+                writer.writeheader()
+                writer.writerow({"application": "Zoom", "cost_center": "ENG",
+                                 "billing_period_start": period_start, "billing_period_end": period_end,
+                                 "actual_billed_cost_inr": amount, "email": "alice@example.com",
+                                 "invoice_id": invoice_id, "line_item_id": "zoom-seat", "sku_id": sku,
+                                 "contract_id": "zoom-contract"})
+
+        contracts = self.root / "tier-contracts.csv"
+        renewals = self.root / "tier-renewals.csv"
+        for effective, amount in ((date(2026, 1, 1), "12000"), (date(2027, 1, 1), "6000")):
+            version = record_contract_version(
+                contracts, contract_id="zoom-contract", vendor="Zoom", owner="FinOps",
+                applications=["Zoom"], effective_date=effective, renewal_date=date(2027, 1, 31),
+                notice_days=30, annual_commitment_inr=Decimal(amount), currency="INR",
+                evidence_type="order_form", evidence_ref=f"evidence/{effective}.pdf",
+                recorded_by="procurement", recorded_on=effective,
+            )
+            approve_contract_version(contracts, "zoom-contract", approved_by="finance", version=version,
+                                     approved_on=effective + timedelta(days=1))
+        create_renewal_campaign(contracts, renewals, as_of=date(2026, 11, 10), horizon_days=90,
+                                created_by="finops")
+        record_owner_decision(renewals, "zoom-contract", 2, decision="renegotiate", decided_by="FinOps",
+                              evidence_ref="renewal/approved", on=date(2026, 11, 12))
+
+        row, = attribute_tier_savings(actions, self.baseline, self.current,
+                                      contracts_path=contracts, renewals_path=renewals)
+        self.assertEqual(row.status, "invoice_reconciled")
+        self.assertEqual(row.confidence, "high")
+        self.assertTrue(row.invoice_reduction_observed)
+        self.assertTrue(row.savings_verified)
+        self.assertEqual(row.baseline_invoice_ids, "inv-before")
+        self.assertEqual(row.current_invoice_ids, "inv-after")
+        self.assertEqual(row.renewal_decision, "renegotiate")
+        self.assertEqual(row.renewal_commitment_change_inr, Decimal("6000.00"))
+        self.assertIn("confidence_reason", format_tier_attributions([row]))
 
     @staticmethod
     def write_detailed_invoice(path: Path, start: str, end: str, amount: str,

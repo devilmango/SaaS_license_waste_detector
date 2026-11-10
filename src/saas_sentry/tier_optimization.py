@@ -5,7 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 import csv
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import hashlib
 from pathlib import Path
@@ -16,9 +16,16 @@ from .engine import InputError, _rows
 
 TIER_FIELDS = ("application", "tier", "feature_capacity", "annual_cost_inr", "provider_tier_id")
 EVENT_FIELDS = ("action_id", "event", "status", "application", "email", "provider", "provider_user_id",
-                "current_tier", "recommended_tier", "current_provider_tier_id",
-                "recommended_provider_tier_id", "annual_savings_inr", "actor", "proposed_by",
+                "provider_license_id", "current_tier", "recommended_tier", "current_provider_tier_id",
+                "recommended_provider_tier_id", "annual_savings_inr", "annual_cost_current_inr",
+                "annual_cost_recommended_inr", "features_used", "observed_features", "active_days",
+                "usage_count", "usage_window_days", "compatibility_reason", "evidence_status",
+                "contract_id", "contract_constraint", "eligible_on", "actor", "proposed_by",
                 "approved_by", "occurred_at", "result")
+LEGACY_EVENT_FIELDS = ("action_id", "event", "status", "application", "email", "provider", "provider_user_id",
+                      "current_tier", "recommended_tier", "current_provider_tier_id",
+                      "recommended_provider_tier_id", "annual_savings_inr", "actor", "proposed_by",
+                      "approved_by", "occurred_at", "result")
 
 
 @dataclass(frozen=True)
@@ -29,36 +36,58 @@ class TierRecommendation:
     application: str
     provider: str
     provider_user_id: str
+    provider_license_id: str
     current_tier: str
     recommended_tier: str
     current_provider_tier_id: str
     recommended_provider_tier_id: str
-    features_used: int
+    features_used: int | None
     annual_cost_current_inr: Decimal
     annual_cost_recommended_inr: Decimal
     annual_savings_inr: Decimal
+    observed_features: str = ""
+    active_days: int | None = None
+    usage_count: int | None = None
+    usage_window_days: int | None = None
+    compatibility_reason: str = ""
+    evidence_status: str = "complete"
+    contract_id: str = ""
+    contract_constraint: str = ""
+    eligible_on: str = ""
     status: str = "proposed"
 
 
-def recommend_downgrades(usage_path: Path, billing_path: Path, tiers_path: Path) -> tuple[TierRecommendation, ...]:
-    """Choose the cheapest tier that supports observed feature usage and costs less."""
+def recommend_downgrades(
+    usage_path: Path, billing_path: Path, tiers_path: Path, *, as_of: date | None = None,
+) -> tuple[TierRecommendation, ...]:
+    """Recommend compatible lower tiers and preserve candidates needing more evidence."""
     usage = _rows(usage_path, {"employee", "email", "application", "features_used"})
     billing = _rows(billing_path, {"email", "application", "license_status", "annual_cost", "license_tier"})
     tier_rows = _rows(tiers_path, set(TIER_FIELDS))
+    today = as_of or date.today()
     catalogs: dict[str, list[dict[str, str]]] = {}
     for line, row in enumerate(tier_rows, start=2):
         app = _norm(row["application"])
         try:
             capacity = int(row["feature_capacity"])
             price = Decimal(row["annual_cost_inr"])
+            max_active = _optional_int(row.get("max_active_days", ""), tiers_path, line, "max_active_days")
+            minimum_active = _optional_int(row.get("minimum_active_days", ""), tiers_path, line,
+                                           "minimum_active_days")
+            max_usage = _optional_int(row.get("max_usage_count", ""), tiers_path, line, "max_usage_count")
+            minimum_window = _optional_int(row.get("minimum_usage_window_days", ""), tiers_path, line,
+                                           "minimum_usage_window_days")
         except (ValueError, InvalidOperation) as exc:
-            raise InputError(f"{tiers_path}:{line}: feature_capacity and annual_cost_inr must be numeric") from exc
+            raise InputError(f"{tiers_path}:{line}: tier thresholds and prices must be numeric") from exc
         if capacity < 0 or not price.is_finite() or price < 0 or not row["tier"].strip() or not row["provider_tier_id"].strip():
             raise InputError(f"{tiers_path}:{line}: tier, provider tier ID, non-negative capacity, and price are required")
+        if any(value is not None and value < 0 for value in (max_active, minimum_active, max_usage, minimum_window)):
+            raise InputError(f"{tiers_path}:{line}: usage thresholds cannot be negative")
         catalog = catalogs.setdefault(app, [])
         if any(_norm(previous["tier"]) == _norm(row["tier"]) for previous in catalog):
             raise InputError(f"{tiers_path}:{line}: duplicate application/tier price row")
         catalog.append(row | {"_capacity": str(capacity), "_price": str(price)})
+
     usage_by_key: dict[tuple[str, str], dict[str, str]] = {}
     seen_usage: set[tuple[str, str]] = set()
     for line, row in enumerate(usage, start=2):
@@ -68,16 +97,21 @@ def recommend_downgrades(usage_path: Path, billing_path: Path, tiers_path: Path)
         if key in seen_usage:
             raise InputError(f"{usage_path}:{line}: duplicate usage identity/application")
         seen_usage.add(key)
-        if not row["features_used"].strip():
-            # Missing provider telemetry is not evidence for a downgrade.
-            continue
-        try:
-            count = int(row["features_used"])
-        except ValueError as exc:
-            raise InputError(f"{usage_path}:{line}: features_used must be a whole number") from exc
-        if count < 0:
-            raise InputError(f"{usage_path}:{line}: features_used cannot be negative")
-        usage_by_key[key] = row | {"_features": str(count)}
+        features = _optional_int(row.get("features_used", ""), usage_path, line, "features_used")
+        active_days = _optional_int(row.get("active_days", ""), usage_path, line, "active_days")
+        usage_count = _optional_int(row.get("usage_count", ""), usage_path, line, "usage_count")
+        window_days = _optional_int(row.get("usage_window_days", ""), usage_path, line, "usage_window_days")
+        if any(value is not None and value < 0 for value in (features, active_days, usage_count, window_days)):
+            raise InputError(f"{usage_path}:{line}: usage telemetry cannot be negative")
+        if active_days is not None and window_days is not None and active_days > window_days:
+            raise InputError(f"{usage_path}:{line}: active_days cannot exceed usage_window_days")
+        usage_by_key[key] = row | {
+            "_features": "" if features is None else str(features),
+            "_active_days": "" if active_days is None else str(active_days),
+            "_usage_count": "" if usage_count is None else str(usage_count),
+            "_window_days": "" if window_days is None else str(window_days),
+        }
+
     recommendations: list[TierRecommendation] = []
     seen: set[tuple[str, str]] = set()
     for line, license_row in enumerate(billing, start=2):
@@ -94,30 +128,127 @@ def recommend_downgrades(usage_path: Path, billing_path: Path, tiers_path: Path)
         if current is None:
             continue
         activity = usage_by_key[key]
-        features = int(activity["_features"])
-        supported = [row for row in catalog if features <= int(row["_capacity"]) < int(current["_capacity"])]
-        if not supported:
-            continue
-        lower = min(supported, key=lambda row: (Decimal(row["_price"]), int(row["_capacity"])))
         try:
             current_cost = Decimal(license_row["annual_cost"])
-        except InvalidOperation as exc:
-            raise InputError(f"{billing_path}:{line}: annual_cost must be numeric") from exc
+            eligible_date = date.fromisoformat(license_row.get("tier_change_effective_date", "")) \
+                if license_row.get("tier_change_effective_date", "").strip() else None
+            commitment_end = date.fromisoformat(license_row.get("commitment_end_date", "")) \
+                if license_row.get("commitment_end_date", "").strip() else None
+        except (InvalidOperation, ValueError) as exc:
+            raise InputError(f"{billing_path}:{line}: annual cost or contract dates are invalid") from exc
         if not current_cost.is_finite() or current_cost < 0:
             raise InputError(f"{billing_path}:{line}: annual_cost must be finite and non-negative")
+        features = activity["_features"]
+        feature_count = int(features) if features else None
+        potential = [row for row in catalog if
+                     int(row["_capacity"]) < int(current["_capacity"])
+                     and Decimal(row["_price"]) < current_cost
+                     and (feature_count is None or feature_count <= int(row["_capacity"]))]
+        if not potential:
+            continue
+        lower = min(potential, key=lambda row: (Decimal(row["_price"]), int(row["_capacity"])))
         saving = (current_cost - Decimal(lower["_price"])).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         if _norm(lower["tier"]) == _norm(current["tier"]) or saving <= 0:
             continue
+
+        observed_features = _feature_set(activity.get("observed_features", ""))
+        supported_features = _feature_set(lower.get("supported_features", ""))
+        missing: list[str] = []
+        incompatible: list[str] = []
+        if feature_count is None:
+            missing.append("features_used")
+        if supported_features and not activity.get("observed_features", "").strip():
+            missing.append("observed feature names")
+        elif supported_features and not observed_features.issubset(supported_features):
+            incompatible.append("observed features exceed the lower tier feature catalog")
+        if lower.get("minimum_usage_window_days", "").strip():
+            window_days = activity["_window_days"]
+            if not window_days:
+                missing.append("usage_window_days")
+            elif int(window_days) < int(lower["minimum_usage_window_days"]):
+                incompatible.append("usage window is shorter than the tier evidence requirement")
+        if lower.get("max_active_days", "").strip():
+            active_days = activity["_active_days"]
+            if not active_days:
+                missing.append("active_days")
+            elif int(active_days) > int(lower["max_active_days"]):
+                incompatible.append("active days exceed the lower tier activity threshold")
+        if lower.get("minimum_active_days", "").strip():
+            active_days = activity["_active_days"]
+            if not active_days:
+                missing.append("active_days")
+            elif int(active_days) < int(lower["minimum_active_days"]):
+                missing.append(f"active_days below the {lower['minimum_active_days']}-day evidence minimum")
+        if lower.get("max_usage_count", "").strip():
+            usage_count = activity["_usage_count"]
+            if not usage_count:
+                missing.append("usage_count")
+            elif int(usage_count) > int(lower["max_usage_count"]):
+                incompatible.append("usage count exceeds the lower tier activity threshold")
+        reason_parts = [
+            f"{feature_count} used features fit capacity {lower['_capacity']}"
+            if feature_count is not None else "feature capacity fit cannot be verified without features_used telemetry"
+        ]
+        if supported_features and observed_features:
+            reason_parts.append("observed feature set is supported")
+        if activity["_window_days"]:
+            reason_parts.append(f"usage window {activity['_window_days']} days")
+        if activity["_active_days"]:
+            reason_parts.append(f"{activity['_active_days']} active days")
+        if activity["_usage_count"]:
+            reason_parts.append(f"usage count {activity['_usage_count']}")
+        if missing:
+            reason_parts.append("missing telemetry: " + ", ".join(sorted(set(missing))))
+        if incompatible:
+            reason_parts.extend(incompatible)
+
+        explicit_allowed = license_row.get("tier_change_allowed", "").strip().casefold()
+        if explicit_allowed and explicit_allowed not in {"true", "false"}:
+            raise InputError(f"{billing_path}:{line}: tier_change_allowed must be true or false")
+        contract_constraint = ""
+        if explicit_allowed == "false":
+            contract_constraint = "contract prohibits mid-term tier changes"
+        elif eligible_date is None and explicit_allowed != "true" and commitment_end and commitment_end > today:
+            eligible_date = commitment_end
+            contract_constraint = "fixed commitment delays change until commitment end"
+        if eligible_date and eligible_date > today and not contract_constraint:
+            contract_constraint = "contract schedules the change for a future effective date"
+
+        if incompatible:
+            status = "incompatible"
+        elif missing:
+            status = "needs_telemetry"
+        elif explicit_allowed == "false":
+            status = "contract_blocked"
+        elif eligible_date and eligible_date > today:
+            status = "scheduled"
+        else:
+            status = "proposed"
         provider = license_row.get("provider", "").casefold()
         user_id = license_row.get("provider_user_id", "").strip()
+        license_id = license_row.get("provider_license_id", "").strip()
         raw = "\0".join((key[0], key[1], current["tier"], lower["tier"],
-                           current["provider_tier_id"], lower["provider_tier_id"], provider, user_id))
+                           current["provider_tier_id"], lower["provider_tier_id"], provider, user_id,
+                           str(feature_count), ";".join(sorted(observed_features)), activity["_active_days"],
+                           activity["_usage_count"], activity["_window_days"], str(current_cost),
+                           lower["_price"], license_row.get("contract_id", ""),
+                           license_row.get("tier_change_allowed", ""), eligible_date.isoformat() if eligible_date else ""))
         action_id = hashlib.sha256(raw.encode()).hexdigest()[:20]
         recommendations.append(TierRecommendation(
-            action_id, activity.get("employee", ""), license_row["email"], license_row["application"],
-            provider, user_id, current["tier"], lower["tier"], current["provider_tier_id"],
-            lower["provider_tier_id"], features, current_cost,
-            Decimal(lower["_price"]), saving,
+            action_id=action_id, employee=activity.get("employee", ""), email=license_row["email"],
+            application=license_row["application"], provider=provider, provider_user_id=user_id,
+            provider_license_id=license_id, current_tier=current["tier"], recommended_tier=lower["tier"],
+            current_provider_tier_id=current["provider_tier_id"], recommended_provider_tier_id=lower["provider_tier_id"],
+            features_used=feature_count, annual_cost_current_inr=current_cost,
+            annual_cost_recommended_inr=Decimal(lower["_price"]), annual_savings_inr=saving,
+            observed_features=";".join(sorted(observed_features)),
+            active_days=int(activity["_active_days"]) if activity["_active_days"] else None,
+            usage_count=int(activity["_usage_count"]) if activity["_usage_count"] else None,
+            usage_window_days=int(activity["_window_days"]) if activity["_window_days"] else None,
+            compatibility_reason="; ".join(reason_parts),
+            evidence_status="needs_telemetry" if missing else "complete",
+            contract_id=license_row.get("contract_id", ""), contract_constraint=contract_constraint,
+            eligible_on=eligible_date.isoformat() if eligible_date else "", status=status,
         ))
     return tuple(sorted(recommendations, key=lambda item: (-item.annual_savings_inr, item.application.casefold(), item.email.casefold())))
 
@@ -127,13 +258,18 @@ def format_recommendations(rows: tuple[TierRecommendation, ...]) -> str:
     output = StringIO()
     writer = csv.writer(output)
     writer.writerow(["action_id", "employee", "email", "application", "provider", "provider_user_id",
-                     "current_tier", "recommended_tier", "current_provider_tier_id",
-                     "recommended_provider_tier_id", "features_used", "annual_cost_current_inr",
+                     "provider_license_id", "current_tier", "recommended_tier", "current_provider_tier_id",
+                     "recommended_provider_tier_id", "features_used", "observed_features", "active_days",
+                     "usage_count", "usage_window_days", "compatibility_reason", "evidence_status",
+                     "contract_id", "contract_constraint", "eligible_on", "annual_cost_current_inr",
                      "annual_cost_recommended_inr", "annual_savings_inr", "status"])
     for row in rows:
         writer.writerow([row.action_id, row.employee, row.email, row.application, row.provider,
-                         row.provider_user_id, row.current_tier, row.recommended_tier,
+                         row.provider_user_id, row.provider_license_id, row.current_tier, row.recommended_tier,
                          row.current_provider_tier_id, row.recommended_provider_tier_id, row.features_used,
+                         row.observed_features, row.active_days, row.usage_count, row.usage_window_days,
+                         row.compatibility_reason, row.evidence_status, row.contract_id,
+                         row.contract_constraint, row.eligible_on,
                          f"{row.annual_cost_current_inr:.2f}", f"{row.annual_cost_recommended_inr:.2f}",
                          f"{row.annual_savings_inr:.2f}", row.status])
     return output.getvalue()
@@ -145,15 +281,15 @@ def _events(path: Path) -> dict[str, dict[str, str]]:
     try:
         with path.open("r", encoding="utf-8-sig", newline="") as handle:
             reader = csv.DictReader(handle)
-            if not set(EVENT_FIELDS).issubset(reader.fieldnames or []):
+            if not set(LEGACY_EVENT_FIELDS).issubset(reader.fieldnames or []):
                 raise InputError(f"{path}: tier action ledger is missing required columns")
-            rows = list(reader)
+            rows = [{field: row.get(field, "") or "" for field in EVENT_FIELDS} for row in reader]
     except OSError as exc:
         raise InputError(f"Cannot read tier action ledger {path}: {exc}") from exc
     states: dict[str, dict[str, str]] = {}
     for line, event in enumerate(rows, start=2):
         action_id, kind = event.get("action_id", ""), event.get("event", "")
-        if not action_id or kind not in {"proposed", "approved", "rejected", "execution_started", "executed", "failed"}:
+        if not action_id or kind not in {"proposed", "approved", "rejected", "execution_started", "executed", "verified", "failed"}:
             raise InputError(f"{path}:{line}: invalid tier action event")
         prior = states.get(action_id)
         if kind == "proposed" and prior:
@@ -166,6 +302,8 @@ def _events(path: Path) -> dict[str, dict[str, str]]:
             raise InputError(f"{path}:{line}: only approved tier actions may execute")
         if kind in {"executed", "failed"} and (not prior or prior["status"] != "execution_started"):
             raise InputError(f"{path}:{line}: execution result has no start event")
+        if kind == "verified" and (not prior or prior["status"] != "executed"):
+            raise InputError(f"{path}:{line}: verification result has no executed event")
         states[action_id] = event
     return states
 
@@ -173,6 +311,17 @@ def _events(path: Path) -> dict[str, dict[str, str]]:
 def _append(path: Path, event: dict[str, str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     exists = path.exists() and path.stat().st_size > 0
+    if exists:
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            if not set(EVENT_FIELDS).issubset(reader.fieldnames or []):
+                old_rows = [{field: row.get(field, "") or "" for field in EVENT_FIELDS} for row in reader]
+                temporary = path.with_name(path.name + ".upgrade")
+                with temporary.open("w", encoding="utf-8", newline="") as upgraded:
+                    writer = csv.DictWriter(upgraded, fieldnames=EVENT_FIELDS)
+                    writer.writeheader()
+                    writer.writerows(old_rows)
+                temporary.replace(path)
     with path.open("a", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=EVENT_FIELDS)
         if not exists:
@@ -191,15 +340,28 @@ def _stage_recommendations(rows: tuple[TierRecommendation, ...], path: Path, *, 
     states = _events(path)
     created = 0
     for row in rows:
+        if row.status not in {"proposed", "scheduled", "needs_telemetry", "incompatible", "contract_blocked"}:
+            continue
         if row.action_id in states:
             continue
-        event = {"action_id": row.action_id, "event": "proposed", "status": "proposed",
+        event = {"action_id": row.action_id, "event": "proposed",
+                 "status": "proposed" if row.status == "scheduled" else row.status,
                  "application": row.application, "email": row.email, "provider": row.provider,
-                 "provider_user_id": row.provider_user_id, "current_tier": row.current_tier,
+                 "provider_user_id": row.provider_user_id, "provider_license_id": row.provider_license_id,
+                 "current_tier": row.current_tier,
                  "recommended_tier": row.recommended_tier,
                  "current_provider_tier_id": row.current_provider_tier_id,
                  "recommended_provider_tier_id": row.recommended_provider_tier_id,
                  "annual_savings_inr": f"{row.annual_savings_inr:.2f}",
+                 "annual_cost_current_inr": f"{row.annual_cost_current_inr:.2f}",
+                 "annual_cost_recommended_inr": f"{row.annual_cost_recommended_inr:.2f}",
+                 "features_used": str(row.features_used), "observed_features": row.observed_features,
+                 "active_days": "" if row.active_days is None else str(row.active_days),
+                 "usage_count": "" if row.usage_count is None else str(row.usage_count),
+                 "usage_window_days": "" if row.usage_window_days is None else str(row.usage_window_days),
+                 "compatibility_reason": row.compatibility_reason, "evidence_status": row.evidence_status,
+                 "contract_id": row.contract_id, "contract_constraint": row.contract_constraint,
+                 "eligible_on": row.eligible_on,
                  "actor": actor.strip(), "proposed_by": actor.strip(),
                  "occurred_at": datetime.now(timezone.utc).isoformat()}
         _append(path, event)
@@ -210,6 +372,22 @@ def _stage_recommendations(rows: tuple[TierRecommendation, ...], path: Path, *, 
 
 def list_tier_actions(path: Path) -> tuple[dict[str, str], ...]:
     return tuple(_events(path).values())
+
+
+def list_tier_action_history(path: Path) -> dict[str, list[dict[str, str]]]:
+    """Return append-only event history, grouped by action ID, after ledger validation."""
+    _events(path)
+    if not path.exists():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            grouped: dict[str, list[dict[str, str]]] = {}
+            for raw in csv.DictReader(handle):
+                row = {field: raw.get(field, "") or "" for field in EVENT_FIELDS}
+                grouped.setdefault(row["action_id"], []).append(dict(row))
+            return grouped
+    except OSError as exc:
+        raise InputError(f"Cannot read tier action ledger {path}: {exc}") from exc
 
 
 def transition_tier_action(path: Path, action_id: str, event: str, *, actor: str,
@@ -233,11 +411,20 @@ def _transition_tier_action(path: Path, action_id: str, event: str, *, actor: st
     if event == "approved" and actor.strip().casefold() == state.get("proposed_by", state.get("actor", "")).casefold():
         raise InputError("tier action approval must be by a different person than the proposer")
     if event == "execute":
-        if (state["provider"] != "zoom" or state["current_provider_tier_id"] != "2"
-                or state["recommended_provider_tier_id"] != "1"):
-            raise InputError("provider execution currently supports only Zoom Licensed (2) to Basic (1) downgrades")
+        if state.get("eligible_on") and date.fromisoformat(state["eligible_on"]) > date.today():
+            raise InputError(f"tier change is contractually scheduled for {state['eligible_on']}")
+        supported = (
+            state["provider"] == "zoom" and state["current_provider_tier_id"] == "2"
+            and state["recommended_provider_tier_id"] == "1"
+        ) or (state["provider"] == "microsoft365" and state["current_provider_tier_id"] != state["recommended_provider_tier_id"])
+        supported = supported or (
+            state["provider"] == "google_workspace"
+            and state["current_provider_tier_id"] != state["recommended_provider_tier_id"]
+        )
+        if not supported:
+            raise InputError("provider execution supports Zoom 2-to-1, Microsoft 365 SKU changes, and Google Workspace same-product SKU changes")
         if not state["provider_user_id"] or operation is None:
-            raise InputError("Zoom provider operation and imported user ID are required")
+            raise InputError("provider operation and imported user ID are required")
         started = state | {"event": "execution_started", "status": "execution_started", "actor": actor.strip(),
                            "occurred_at": datetime.now(timezone.utc).isoformat(), "result": ""}
         _append(path, started)
@@ -251,7 +438,11 @@ def _transition_tier_action(path: Path, action_id: str, event: str, *, actor: st
         completed = started | {"event": "executed", "status": "executed", "occurred_at": datetime.now(timezone.utc).isoformat(),
                                "result": str(result)[:1000]}
         _append(path, completed)
-        return completed
+        verified = completed | {"event": "verified", "status": "verified",
+                                 "occurred_at": datetime.now(timezone.utc).isoformat(),
+                                 "result": str(result)[:1000]}
+        _append(path, verified)
+        return verified
     transitioned = state | {"event": target_event, "status": target_event, "actor": actor.strip(),
                             "occurred_at": datetime.now(timezone.utc).isoformat()}
     if event == "approved":
@@ -262,6 +453,19 @@ def _transition_tier_action(path: Path, action_id: str, event: str, *, actor: st
 
 def _norm(value: str) -> str:
     return " ".join(value.casefold().split())
+
+
+def _optional_int(value: str, path: Path, line: int, field: str) -> int | None:
+    if not value.strip():
+        return None
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise InputError(f"{path}:{line}: {field} must be a whole number") from exc
+
+
+def _feature_set(value: str) -> set[str]:
+    return {item.strip().casefold() for item in value.replace(",", ";").split(";") if item.strip()}
 
 
 @contextmanager

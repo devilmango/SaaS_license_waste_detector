@@ -109,7 +109,9 @@ def _bearer_mutation(
     if body is not None:
         request_headers.setdefault("Content-Type", "application/json")
     try:
-        with urlopen(Request(url, data=body, headers=request_headers, method=method), timeout=30):
+        with _open_with_rate_limit(
+            Request(url, data=body, headers=request_headers, method=method), provider, timeout=30,
+        ):
             pass
     except HTTPError as exc:
         raise ConnectorError(f"{provider} API returned HTTP {exc.code}") from exc
@@ -315,6 +317,58 @@ class Microsoft365Connector:
         request = Request(url, data=body, headers={**headers, "Content-Type": "application/json"}, method="POST")
         self._json_request(request)
         return "license_removed"
+
+    def change_user_license_tier(self, user_id: str, old_sku_id: str, new_sku_id: str) -> str:
+        """Replace one direct M365 SKU and verify the new SKU on a fresh Graph read."""
+        try:
+            user_id = str(uuid.UUID(user_id))
+            old_sku_id, new_sku_id = str(uuid.UUID(old_sku_id)), str(uuid.UUID(new_sku_id))
+        except ValueError as exc:
+            raise ConnectorError("Microsoft 365 tier changes require user and SKU UUIDs") from exc
+        if old_sku_id.casefold() == new_sku_id.casefold():
+            raise ConnectorError("Microsoft 365 current and replacement SKUs must differ")
+        token = self._token()
+        user_url = f"{GRAPH_ROOT}/users/{quote(user_id, safe='')}?{urlencode({'$select': 'id,assignedLicenses,licenseAssignmentStates'})}"
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+
+        def read_user() -> dict:
+            user = self._json_request(Request(user_url, headers=headers))
+            if str(user.get("id", "")).casefold() != user_id.casefold():
+                raise ConnectorError("Microsoft 365 returned a different user than the approved tier target")
+            if not isinstance(user.get("assignedLicenses"), list):
+                raise ConnectorError("Microsoft 365 omitted assignedLicenses; refusing the tier change")
+            return user
+
+        current = read_user()
+        assigned = {str(row.get("skuId", "")).casefold() for row in current["assignedLicenses"] if isinstance(row, dict)}
+        states = current.get("licenseAssignmentStates")
+        if not isinstance(states, list):
+            raise ConnectorError("Microsoft 365 omitted licenseAssignmentStates; refusing the tier change")
+        old_states = [row for row in states if isinstance(row, dict)
+                      and str(row.get("skuId", "")).casefold() == old_sku_id.casefold()]
+        if old_sku_id.casefold() not in assigned or not old_states:
+            raise ConnectorError("Microsoft 365 no longer has the approved current SKU")
+        if any(row.get("assignedByGroup") for row in old_states):
+            raise ConnectorError("The current Microsoft 365 SKU is group-assigned; change it through its group workflow")
+        if not any(str(row.get("state", "")).casefold() == "active" for row in old_states):
+            raise ConnectorError("The current Microsoft 365 SKU is not active")
+        if new_sku_id.casefold() in assigned:
+            raise ConnectorError("Microsoft 365 target SKU is already assigned; refusing an ambiguous change")
+        url = f"{GRAPH_ROOT}/users/{quote(user_id, safe='')}/assignLicense"
+        payload = {"addLicenses": [{"skuId": new_sku_id, "disabledPlans": []}], "removeLicenses": [old_sku_id]}
+        self._json_request(Request(url, data=json.dumps(payload).encode(),
+                                   headers={**headers, "Content-Type": "application/json"}, method="POST"))
+        updated = read_user()
+        new_assigned = {str(row.get("skuId", "")).casefold() for row in updated["assignedLicenses"] if isinstance(row, dict)}
+        if old_sku_id.casefold() in new_assigned or new_sku_id.casefold() not in new_assigned:
+            raise ConnectorError("Microsoft 365 did not confirm the replacement SKU assignment")
+        new_states = [row for row in updated.get("licenseAssignmentStates", []) if isinstance(row, dict)
+                      and str(row.get("skuId", "")).casefold() == new_sku_id.casefold()]
+        if not new_states or any(row.get("assignedByGroup") for row in new_states):
+            raise ConnectorError("Microsoft 365 replacement SKU is missing direct assignment verification")
+        if not any(str(row.get("state", "")).casefold() == "active" for row in new_states):
+            raise ConnectorError("Microsoft 365 replacement SKU is not active after the change")
+        return "microsoft365_tier_change_verified"
 
     def _get_pages(self, url: str, token: str) -> list[dict]:
         output: list[dict] = []
@@ -549,6 +603,53 @@ class GoogleWorkspaceConnector:
             raise ConnectorError("Google Workspace returned a different license target; refusing the reclaim")
         _bearer_mutation(url, self.access_token, "Google Workspace", self.HOSTS, method="DELETE")
         return "license_revoked"
+
+    def change_user_license_tier(self, user_id: str, old_sku_id: str, new_sku_id: str) -> str:
+        """Reassign a Workspace user's SKU within one product and verify both SKU states."""
+        try:
+            old_product, old_sku = json.loads(old_sku_id)
+            new_product, new_sku = json.loads(new_sku_id)
+        except (ValueError, TypeError) as exc:
+            raise ConnectorError("Google Workspace tier IDs must encode [product_id, sku_id]") from exc
+        if (not all(isinstance(value, str) and value.strip()
+                    for value in (user_id, old_product, old_sku, new_product, new_sku))):
+            raise ConnectorError("Google Workspace tier change target is incomplete")
+        if old_product.casefold() != new_product.casefold() or old_sku.casefold() == new_sku.casefold():
+            raise ConnectorError("Google Workspace can only reassign to a different SKU in the same product")
+
+        def assignment(sku: str) -> dict | None:
+            url = "https://licensing.googleapis.com/apps/licensing/v1/product/" + \
+                "/".join(quote(value, safe="") for value in (old_product, "sku", sku, "user", user_id))
+            request = Request(url, headers={"Authorization": f"Bearer {self.access_token}", "Accept": "application/json"})
+            try:
+                with _open_with_rate_limit(request, "Google Workspace", timeout=30) as response:
+                    result = json.loads(response.read().decode("utf-8"))
+            except HTTPError as exc:
+                if exc.code == 404:
+                    return None
+                raise ConnectorError(f"Google Workspace API returned HTTP {exc.code}") from exc
+            except (URLError, TimeoutError, OSError, ValueError) as exc:
+                raise ConnectorError(f"Google Workspace API request failed: {type(exc).__name__}") from exc
+            if not isinstance(result, dict):
+                raise ConnectorError("Google Workspace returned an invalid license assignment")
+            if (str(result.get("userId", "")).casefold() != user_id.casefold()
+                    or str(result.get("productId", "")).casefold() != old_product.casefold()
+                    or str(result.get("skuId", "")).casefold() != sku.casefold()):
+                raise ConnectorError("Google Workspace returned a different license assignment")
+            return result
+
+        if assignment(old_sku) is None:
+            raise ConnectorError("Google Workspace current SKU is no longer assigned")
+        if assignment(new_sku) is not None:
+            raise ConnectorError("Google Workspace target SKU is already assigned; refusing an ambiguous change")
+        url = "https://licensing.googleapis.com/apps/licensing/v1/product/" + \
+            "/".join(quote(value, safe="") for value in (old_product, "sku", old_sku, "user", user_id))
+        body = json.dumps({"productId": old_product, "skuId": new_sku, "userId": user_id}).encode("utf-8")
+        _bearer_mutation(url, self.access_token, "Google Workspace", self.HOSTS,
+                         method="PATCH", body=body)
+        if assignment(old_sku) is not None or assignment(new_sku) is None:
+            raise ConnectorError("Google Workspace did not confirm the replacement SKU assignment")
+        return "google_workspace_tier_change_verified"
 
 
 class SlackConnector:
@@ -985,6 +1086,24 @@ class ZoomConnector:
         if str(updated.get("id", "")) != user_id or updated.get("type") != 1:
             raise ConnectorError("Zoom did not confirm the user downgrade to Basic")
         return "license_changed_to_basic"
+
+
+def change_provider_license_tier(
+    provider: str, user_id: str, license_id: str, old_tier_id: str, new_tier_id: str,
+) -> str:
+    """Change one tier only when a provider adapter can recheck and verify it live."""
+    provider = provider.strip().casefold()
+    if provider == "microsoft365":
+        old_sku = license_id or old_tier_id
+        return Microsoft365Connector.from_environment().change_user_license_tier(user_id, old_sku, new_tier_id)
+    if provider == "google_workspace":
+        old_sku = license_id or old_tier_id
+        return GoogleWorkspaceConnector.from_environment().change_user_license_tier(user_id, old_sku, new_tier_id)
+    if provider == "zoom":
+        if old_tier_id != "2" or new_tier_id != "1":
+            raise ConnectorError("Zoom tier changes support only Licensed (2) to Basic (1)")
+        return ZoomConnector.from_environment().remove_user_license(user_id, old_tier_id)
+    raise ConnectorError(f"Provider {provider!r} has no verified tier-change adapter")
 
 
 def transfer_provider_license(

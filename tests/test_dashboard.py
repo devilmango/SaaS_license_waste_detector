@@ -11,6 +11,9 @@ from decimal import Decimal
 from saas_sentry.dashboard import load_dashboard_users, route_request
 from saas_sentry.dashboard_auth import Principal
 from saas_sentry.actions import propose_action, transition_action
+from saas_sentry.tier_optimization import (
+    recommend_downgrades, stage_recommendations, transition_tier_action,
+)
 
 
 class DashboardTests(unittest.TestCase):
@@ -48,6 +51,7 @@ class DashboardTests(unittest.TestCase):
         self.assertIn(b"/api/report", html)
         self.assertIn(b"Action-level invoice attribution", html)
         self.assertIn(b"Identity match review", html)
+        self.assertIn(b"License tier recommendations", html)
 
         status, content_type, body = self.get("/api/report")
         report = json.loads(body)
@@ -64,6 +68,40 @@ class DashboardTests(unittest.TestCase):
     def test_api_rejects_mutations_and_unknown_routes(self) -> None:
         self.assertEqual(route_request("POST", "/api/report", self.options)[0], 405)
         self.assertEqual(route_request("GET", "/api/not-a-route", self.options)[0], 404)
+
+    def test_tier_recommendation_review_execution_and_history_in_dashboard(self) -> None:
+        usage = self.root / "tier-usage.csv"
+        billing = self.root / "tier-billing.csv"
+        tiers = self.root / "tiers.csv"
+        usage.write_text("employee,email,application,features_used\nAlice,alice@example.com,Zoom,2\n", encoding="utf-8")
+        billing.write_text(
+            "email,application,license_status,annual_cost,license_tier,provider,provider_user_id,provider_license_id\n"
+            "alice@example.com,Zoom,active,12000,2,zoom,zoom-user,2\n", encoding="utf-8",
+        )
+        tiers.write_text("application,tier,feature_capacity,annual_cost_inr,provider_tier_id\n"
+                         "Zoom,1,5,6000,1\nZoom,2,20,12000,2\n", encoding="utf-8")
+        ledger = self.root / "tier-actions.csv"
+        action = recommend_downgrades(usage, billing, tiers)[0]
+        stage_recommendations((action,), ledger, actor="analyst@example.com")
+        self.options["tier_actions"] = ledger
+        status, _, body = route_request("GET", "/api/tier-actions", self.options,
+                                        principal=Principal("viewer@example.com", "viewer"))
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["actions"][0]["compatibility_reason"], action.compatibility_reason)
+
+        status, _, body = route_request("POST", f"/api/tier-actions/{action.action_id}/approved", self.options,
+                                        principal=Principal("reviewer@example.com", "reviewer"), body=b"{}")
+        self.assertEqual(status, 200, body)
+        status, _, body = route_request("POST", f"/api/tier-actions/{action.action_id}/execute", self.options,
+                                        principal=Principal("viewer@example.com", "viewer"), body=b"{}")
+        self.assertEqual(status, 403)
+        with patch("saas_sentry.dashboard.change_provider_license_tier", return_value="zoom_verified") as execute:
+            status, _, body = route_request("POST", f"/api/tier-actions/{action.action_id}/execute", self.options,
+                                            principal=Principal("admin@example.com", "admin"), body=b"{}")
+        self.assertEqual(status, 200, body)
+        self.assertEqual(json.loads(body)["action"]["status"], "verified")
+        self.assertEqual(len(json.loads(body)["history"]), 5)
+        execute.assert_called_once()
 
     def test_reviewer_can_record_decision_but_viewer_cannot(self) -> None:
         report = json.loads(self.get("/api/report")[2])
@@ -221,6 +259,60 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(json.loads(body)["items"], [])
         _, _, history = route_request("GET", "/api/identity-review", self.options, principal=reviewer)
         self.assertEqual(len(json.loads(history)["corrections"]), 1)
+
+        admin = Principal("admin@example.com", "admin")
+        status, _, body = route_request("GET", "/api/identity-rules", self.options, principal=admin)
+        self.assertEqual(status, 200, body)
+        rule, = json.loads(body)["rules"]
+        self.assertTrue(rule["can_manage"])
+        self.assertEqual(rule["status"], "active")
+        status, _, body = route_request(
+            "POST", "/api/identity-rules/scim/scim-1/correct", self.options, principal=admin,
+            body=json.dumps({"decision": "map", "employee_id": "E1", "note": "Confirmed by directory owner"}).encode(),
+        )
+        self.assertEqual(status, 200, body)
+        status, _, body = route_request(
+            "POST", "/api/identity-rules/scim/scim-1/deactivate", self.options, principal=admin,
+            body=json.dumps({"note": "Mapping no longer needed"}).encode(),
+        )
+        self.assertEqual(status, 200, body)
+        status, _, body = route_request("GET", "/api/identity-rules", self.options, principal=admin)
+        self.assertEqual(json.loads(body)["rules"][0]["status"], "deactivated")
+        status, _, html = self.get("/")
+        self.assertEqual(status, 200)
+        self.assertIn(b"Saved identity mappings", html)
+
+    def test_tier_savings_dashboard_shows_estimate_and_invoice_reconciliation_state(self) -> None:
+        usage = self.root / "tier-usage.csv"
+        usage.write_text("employee,email,application,features_used\nAlice,alice@example.com,Zoom,2\n", encoding="utf-8")
+        billing = self.root / "tier-billing.csv"
+        billing.write_text(
+            "email,application,license_status,annual_cost,license_tier,provider,provider_user_id\n"
+            "alice@example.com,Zoom,active,12000,2,zoom,user-1\n", encoding="utf-8",
+        )
+        catalog = self.root / "tier-catalog.csv"
+        catalog.write_text(
+            "application,tier,feature_capacity,annual_cost_inr,provider_tier_id\n"
+            "Zoom,1,5,6000,1\nZoom,2,20,12000,2\n", encoding="utf-8",
+        )
+        ledger = self.root / "tier-actions.csv"
+        recommendation, = recommend_downgrades(usage, billing, catalog)
+        stage_recommendations([recommendation], ledger, actor="analyst")
+        transition_tier_action(ledger, recommendation.action_id, "approved", actor="manager")
+        baseline, current = self.root / "baseline.csv", self.root / "current.csv"
+        invoice_header = "application,cost_center,billing_period_start,billing_period_end,actual_billed_cost_inr,email\n"
+        baseline.write_text(invoice_header + "Zoom,ENG,2026-08-01,2026-09-01,1000,alice@example.com\n", encoding="utf-8")
+        current.write_text(invoice_header + "Zoom,ENG,2026-09-01,2026-10-01,1000,alice@example.com\n", encoding="utf-8")
+        self.options.update({"tier_actions": ledger, "invoice_baseline": baseline, "invoice_current": current})
+        status, _, body = route_request("GET", "/api/tier-savings", self.options,
+                                        principal=Principal("admin@example.com", "admin"))
+        result = json.loads(body)
+        self.assertEqual(status, 200, body)
+        self.assertTrue(result["configured"])
+        action, = result["actions"]
+        self.assertEqual(action["estimated_annual_savings_inr"], "6000.00")
+        self.assertEqual(action["status"], "awaiting_execution")
+        self.assertEqual(action["confidence"], "none")
 
 
 if __name__ == "__main__":

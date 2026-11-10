@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+from io import BytesIO
 import json
 from datetime import date
 from pathlib import Path
@@ -12,6 +13,7 @@ from saas_sentry.connectors import (
     ConnectorError,
     GitHubCopilotConnector,
     GoogleWorkspaceConnector,
+    Microsoft365Connector,
     SlackConnector,
     ZoomConnector,
 )
@@ -127,6 +129,73 @@ class ProviderConnectorTests(unittest.TestCase):
         self.assertEqual(result, "license_revoked")
         verify.assert_called_once_with(url, "token", "Google Workspace", connector.HOSTS)
         delete.assert_called_once_with(url, "token", "Google Workspace", connector.HOSTS, method="DELETE")
+
+    def test_google_workspace_tier_change_rechecks_and_verifies_sku_assignments(self) -> None:
+        connector = GoogleWorkspaceConnector("token")
+        assigned = {"Business": True, "Enterprise": False}
+
+        class Response:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def read(self):
+                return json.dumps(self.payload).encode()
+
+        def live_read(request, *_args, **_kwargs):
+            sku = request.full_url.split("/sku/")[1].split("/")[0]
+            if not assigned[sku]:
+                raise __import__("urllib.error", fromlist=["HTTPError"]).HTTPError(
+                    request.full_url, 404, "not found", {}, BytesIO(b"{}"),
+                )
+            return Response({"productId": "Google-Apps", "skuId": sku, "userId": "person@example.com"})
+
+        def mutate(*_args, **kwargs):
+            self.assertEqual(kwargs["method"], "PATCH")
+            self.assertEqual(json.loads(kwargs["body"]), {
+                "productId": "Google-Apps", "skuId": "Enterprise", "userId": "person@example.com",
+            })
+            assigned.update(Business=False, Enterprise=True)
+
+        with patch("saas_sentry.connectors._open_with_rate_limit", side_effect=live_read), \
+                patch("saas_sentry.connectors._bearer_mutation", side_effect=mutate) as mutation:
+            result = connector.change_user_license_tier(
+                "person@example.com", '["Google-Apps", "Business"]', '["Google-Apps", "Enterprise"]',
+            )
+        self.assertEqual(result, "google_workspace_tier_change_verified")
+        mutation.assert_called_once()
+
+    def test_microsoft_365_tier_change_rechecks_direct_sku_and_verifies_new_sku(self) -> None:
+        connector = Microsoft365Connector("tenant", "client", "secret")
+        user_id = "11111111-1111-1111-1111-111111111111"
+        old_sku = "22222222-2222-2222-2222-222222222222"
+        new_sku = "33333333-3333-3333-3333-333333333333"
+        current = {"id": user_id, "assignedLicenses": [{"skuId": old_sku}],
+                   "licenseAssignmentStates": [{"skuId": old_sku, "state": "Active"}]}
+        updated = {"id": user_id, "assignedLicenses": [{"skuId": new_sku}],
+                   "licenseAssignmentStates": [{"skuId": new_sku, "state": "Active"}]}
+        with patch.object(connector, "_token", return_value="token"), patch.object(
+            connector, "_json_request", side_effect=[current, {}, updated],
+        ) as request:
+            result = connector.change_user_license_tier(user_id, old_sku, new_sku)
+        self.assertEqual(result, "microsoft365_tier_change_verified")
+        self.assertEqual(request.call_count, 3)
+        mutation = request.call_args_list[1].args[0]
+        self.assertEqual(json.loads(mutation.data), {"addLicenses": [{"skuId": new_sku, "disabledPlans": []}],
+                                                    "removeLicenses": [old_sku]})
+        stale = current | {"assignedLicenses": [], "licenseAssignmentStates": []}
+        with patch.object(connector, "_token", return_value="token"), patch.object(
+            connector, "_json_request", return_value=stale,
+        ) as request:
+            with self.assertRaisesRegex(ConnectorError, "no longer has"):
+                connector.change_user_license_tier(user_id, old_sku, new_sku)
+            request.assert_called_once()
+            self.assertEqual(request.call_args.args[0].get_method(), "GET")
 
     def test_github_copilot_reclaim_targets_only_selected_username(self) -> None:
         connector = GitHubCopilotConnector("token")
